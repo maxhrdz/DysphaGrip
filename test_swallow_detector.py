@@ -71,6 +71,32 @@ class CalibrationTests(unittest.TestCase):
 
 
 class DetectionTests(unittest.TestCase):
+    def test_restart_preserves_previous_events_and_appends_to_same_csv(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "events.csv"
+            path.touch()
+            for _ in range(2):
+                previous_rows = path.read_bytes()
+                detector = SwallowEventDetector(calibration_seconds=0, csv_path=path)
+                when = calibrate(detector) + 0.2
+                detector.on_audio(loud_audio(), now=when)
+                detector.on_imu((1, 0, 1), (4, 0, 0), now=when)
+                self.assertTrue(path.read_bytes().startswith(previous_rows))
+
+            with path.open(newline="", encoding="utf-8") as file:
+                self.assertEqual(
+                    [row["event_type"] for row in csv.DictReader(file)],
+                    ["possible_swallow_event", "possible_swallow_event"],
+                )
+
+    def test_first_event_accepts_overlapping_signals_with_different_onsets(self):
+        detector, _path = make_detector()
+        when = calibrate(detector)
+        for step in range(11):
+            detector.on_audio(loud_audio(), now=when + step * 0.1)
+        detector.on_imu((1, 0, 1), (4, 0, 0), now=when + 1)
+        self.assertEqual(detector.event_count, 1)
+
     def test_coincident_audio_and_motion_records_one_event(self):
         detector, path = make_detector()
         moment = calibrate(detector)
@@ -97,6 +123,8 @@ class DetectionTests(unittest.TestCase):
         second = first + 0.4
         detector.on_audio(loud_audio(), now=first)
         detector.on_imu((1.0, 0.0, 1.0), (4.0, 0.0, 0.0), now=first)
+        detector.on_audio(quiet_audio(), now=first + 0.1)
+        detector.on_imu((1.0, 0.0, 1.0), (0.2, 0.0, 0.0), now=first + 0.1)
         detector.on_audio(loud_audio(), now=second)
         detector.on_imu((1.2, 0.2, 1.0), (5.0, 0.0, 0.0), now=second)
 
@@ -111,12 +139,24 @@ class DetectionTests(unittest.TestCase):
         later = first + 1.6
         detector.on_audio(loud_audio(), now=first)
         detector.on_imu((1.0, 0.0, 1.0), (4.0, 0.0, 0.0), now=first)
+        detector.on_audio(quiet_audio(), now=first + 0.1)
+        detector.on_imu((1.0, 0.0, 1.0), (0.2, 0.0, 0.0), now=first + 0.1)
         detector.on_audio(loud_audio(), now=later)
         detector.on_imu((1.4, 0.0, 1.0), (6.0, 0.0, 0.0), now=later)
         self.assertEqual(detector.event_count, 2)
 
 
 class FalsePositiveTests(unittest.TestCase):
+    def test_continuous_activity_counts_once_across_cooldowns(self):
+        detector, _path = make_detector()
+        moment = calibrate(detector)
+        for step in range(41):
+            when = moment + step * 0.1
+            detector.on_audio(loud_audio(), now=when)
+            detector.on_imu((0.0, 0.0, 1.0), (4.0, 0.0, 0.0), now=when)
+
+        self.assertEqual(detector.event_count, 1)
+
     def test_audio_without_motion_is_not_an_event(self):
         detector, _path = make_detector()
         moment = calibrate(detector)

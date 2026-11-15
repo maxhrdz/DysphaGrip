@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 experiments/
 dysphagrip_events.csv
+.venv/
+.DS_Store
+saliva*.wav
+dysphagrip_test.wav

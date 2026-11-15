@@ -1,4 +1,5 @@
 import csv
+import os
 import re
 import time
 import threading
@@ -6,6 +7,9 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
+
+
+RECENT_EVENT_LIMIT = 200
 
 
 class SwallowEventDetector:
@@ -25,6 +29,7 @@ class SwallowEventDetector:
         audio_multiplier=2.5,
         imu_multiplier=3.0,
         csv_path="dysphagrip_events.csv",
+        keep_session_events=False,
     ):
         self.calibration_seconds = calibration_seconds
         self.coincidence_seconds = coincidence_seconds
@@ -45,32 +50,37 @@ class SwallowEventDetector:
         self.turn_threshold = None
 
         self.previous_tilt = None
+        self.audio_needs_release = False
+        self.motion_needs_release = False
         self.last_audio_hit = None
         self.last_imu_hit = None
 
         self.ready = False
         self.event_count = 0
         self.events = []
+        self.keep_session_events = keep_session_events
         self.last_calibration_warning = 0.0
 
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with self.csv_path.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "timestamp",
-                "elapsed_seconds",
-                "event_id",
-                "event_type",
-                "audio_rms",
-                "audio_peak",
-                "audio_threshold",
-                "imu_activity",
-                "tilt_delta",
-                "turn_magnitude",
-                "time_difference_seconds",
-            ])
+        # Write the header at offset zero, even if two sessions start together.
+        fd = os.open(self.csv_path, os.O_RDWR | os.O_CREAT, 0o666)
+        with os.fdopen(fd, "r+", newline="", encoding="utf-8") as file:
+            if not file.read(1):
+                csv.writer(file).writerow([
+                    "timestamp",
+                    "elapsed_seconds",
+                    "event_id",
+                    "event_type",
+                    "audio_rms",
+                    "audio_peak",
+                    "audio_threshold",
+                    "imu_activity",
+                    "tilt_delta",
+                    "turn_magnitude",
+                    "time_difference_seconds",
+                ])
 
         print("[DysphaGrip] Detector initialized")
         print("[DysphaGrip] Not a medical assessment of swallow safety.")
@@ -184,16 +194,16 @@ class SwallowEventDetector:
                 self.try_finish_calibration(now)
                 return
 
-            if now - self.last_event_time < self.cooldown_seconds:
+            if rms < self.audio_threshold:
+                self.audio_needs_release = False
                 return
-
-            if rms >= self.audio_threshold:
-                self.last_audio_hit = {
-                    "time": now,
-                    "rms": rms,
-                    "peak": peak,
-                }
-                event = self.try_detect(now)
+            if now - self.last_event_time < self.cooldown_seconds:
+                self.audio_needs_release = True
+                return
+            if self.audio_needs_release:
+                return
+            self.last_audio_hit = {"time": now, "rms": rms, "peak": peak}
+            event = self.try_detect(now)
 
         if event:
             self._record(event)
@@ -225,20 +235,20 @@ class SwallowEventDetector:
                 self.try_finish_calibration(now)
                 return
 
-            if now - self.last_event_time < self.cooldown_seconds:
+            if tilt_delta < self.tilt_threshold and turn_magnitude < self.turn_threshold:
+                self.motion_needs_release = False
                 return
-
-            movement_detected = (
-                tilt_delta >= self.tilt_threshold
-                or turn_magnitude >= self.turn_threshold
-            )
-            if movement_detected:
-                self.last_imu_hit = {
-                    "time": now,
-                    "tilt_delta": tilt_delta,
-                    "turn_magnitude": turn_magnitude,
-                }
-                event = self.try_detect(now)
+            if now - self.last_event_time < self.cooldown_seconds:
+                self.motion_needs_release = True
+                return
+            if self.motion_needs_release:
+                return
+            self.last_imu_hit = {
+                "time": now,
+                "tilt_delta": tilt_delta,
+                "turn_magnitude": turn_magnitude,
+            }
+            event = self.try_detect(now)
 
         if event:
             self._record(event)
@@ -261,10 +271,13 @@ class SwallowEventDetector:
             return None
 
         self.last_event_time = now
+        self.audio_needs_release = True
+        self.motion_needs_release = True
         self.event_count += 1
         imu_activity = max(imu["tilt_delta"], imu["turn_magnitude"])
         event = {
             "event_id": self.event_count,
+            "monotonic": now,
             "timestamp": datetime.now().astimezone().isoformat(
                 timespec="milliseconds"
             ),
@@ -279,16 +292,12 @@ class SwallowEventDetector:
         }
         self.last_audio_hit = None
         self.last_imu_hit = None
+        self.events.append(event)
+        if not self.keep_session_events and len(self.events) > RECENT_EVENT_LIMIT:
+            del self.events[:-RECENT_EVENT_LIMIT]
         return event
 
     def _record(self, event):
-        recorded = dict(event)
-        recorded["monotonic"] = self.start_time + float(event["elapsed"])
-        with self.lock:
-            self.events.append(recorded)
-            if len(self.events) > 200:
-                del self.events[:-200]
-
         with self.csv_path.open("a", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow([
@@ -313,14 +322,42 @@ class SwallowEventDetector:
         print(f"Total Events: {event['event_id']}")
 
 
+IMU_NUMBER = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
 IMU_PATTERN = re.compile(
-    r"Tilt X:\s*([-\d.]+)\s+"
-    r"Y:\s*([-\d.]+)\s+"
-    r"Z:\s*([-\d.]+)\s*\|\s*"
-    r"Turn X:\s*([-\d.]+)\s+"
-    r"Y:\s*([-\d.]+)\s+"
-    r"Z:\s*([-\d.]+)"
+    rf"Tilt X:\s*{IMU_NUMBER}\s+Y:\s*{IMU_NUMBER}\s+Z:\s*{IMU_NUMBER}\s*\|\s*"
+    rf"Turn X:\s*{IMU_NUMBER}\s+Y:\s*{IMU_NUMBER}\s+Z:\s*{IMU_NUMBER}(?=\s|$)"
 )
+
+
+def parse_imu_line(line):
+    match = IMU_PATTERN.search(line)
+    if not match:
+        return None
+    values = tuple(float(value) for value in match.groups())
+    return values if np.isfinite(values).all() else None
+
+
+def read_arduino(port_name, stop_event, on_sample):
+    import serial
+
+    with serial.Serial(port_name, 115200, timeout=0.2) as arduino:
+        print(f"Puerto serie abierto: {port_name}")
+        last_sample_at = time.monotonic()
+        warned = False
+        last_line = ""
+        while not stop_event.is_set():
+            raw = arduino.readline()
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                last_line = line
+            values = parse_imu_line(line) if raw.endswith((b"\n", b"\r")) else None
+            if values is not None:
+                last_sample_at = time.monotonic()
+                warned = False
+                on_sample(values)
+            elif not warned and time.monotonic() - last_sample_at > 2.0:
+                print(f"Sin tramas IMU en {port_name}. Última línea: {last_line!r}")
+                warned = True
 
 
 def find_contact_mic():
@@ -349,6 +386,8 @@ def arduino_port_score(port):
 
 
 def choose_arduino_port(ports):
+    if not ports:
+        raise SystemExit("No hay puertos serie. Revisa el USB del Arduino.")
     candidates = [port for port in ports if arduino_port_score(port) == 0]
     if len(candidates) == 1:
         port = candidates[0]
@@ -359,12 +398,17 @@ def choose_arduino_port(ports):
     print("Puertos del Arduino:")
     for index, port in enumerate(shown):
         print(f"{index}: {port.device} - {port.description}")
-    return shown[int(input("Arduino port index: "))].device
+    try:
+        selected = int(input("Arduino port index: "))
+    except (ValueError, EOFError):
+        raise SystemExit("Selecciona el número de un puerto de la lista.") from None
+    if not 0 <= selected < len(shown):
+        raise SystemExit("Selecciona el número de un puerto de la lista.")
+    return shown[selected].device
 
 
 def main():
     import sounddevice as sd
-    import serial
     from serial.tools import list_ports
 
     device, info = find_contact_mic()
@@ -375,13 +419,7 @@ def main():
         f"(device {device}, {channels} ch @ {sample_rate} Hz)"
     )
 
-    ports = list(list_ports.comports())
-    if not ports:
-        raise SystemExit(
-            "No hay puertos serie. Revisa el USB del Arduino."
-        )
-
-    port_name = choose_arduino_port(ports)
+    port_name = choose_arduino_port(list(list_ports.comports()))
     detector = SwallowEventDetector()
     stop_event = threading.Event()
 
@@ -390,35 +428,20 @@ def main():
             print(status)
         detector.on_audio(np.array(indata[:, 0], copy=True))
 
-    def read_arduino():
-        try:
-            with serial.Serial(port_name, 115200, timeout=0.2) as arduino:
-                print(f"Puerto serie abierto: {port_name}")
-                opened = time.monotonic()
-                warned = False
-                last_line = ""
-                while not stop_event.is_set():
-                    line = arduino.readline().decode(
-                        "utf-8", errors="ignore"
-                    ).strip()
-                    if line:
-                        last_line = line
-                    match = IMU_PATTERN.search(line)
-                    if not match:
-                        if not warned and time.monotonic() - opened > 2.0:
-                            print(
-                                "Sin tramas IMU en "
-                                f"{port_name}. Última línea: {last_line!r}"
-                            )
-                            warned = True
-                        continue
-                    warned = True
-                    values = [float(value) for value in match.groups()]
-                    detector.on_imu(values[:3], values[3:])
-        except Exception as error:
-            print("Arduino error:", error)
+    reader_error = None
 
-    reader = threading.Thread(target=read_arduino, daemon=True)
+    def on_sample(values):
+        detector.on_imu(values[:3], values[3:])
+
+    def run_reader():
+        nonlocal reader_error
+        try:
+            read_arduino(port_name, stop_event, on_sample)
+        except Exception as error:
+            reader_error = error
+            stop_event.set()
+
+    reader = threading.Thread(target=run_reader, daemon=True)
     reader.start()
     print("Ctrl+C para detener.")
 
@@ -431,13 +454,14 @@ def main():
             dtype="float32",
             callback=audio_callback,
         ):
-            while not stop_event.is_set():
-                time.sleep(0.2)
+            stop_event.wait()
     except KeyboardInterrupt:
         print("\nDetenido.")
     finally:
         stop_event.set()
         reader.join(timeout=1)
+    if reader_error is not None:
+        raise SystemExit(f"Error de lectura del Arduino: {reader_error}") from reader_error
 
 
 if __name__ == "__main__":

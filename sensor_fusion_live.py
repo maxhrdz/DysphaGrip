@@ -1,6 +1,6 @@
 import argparse
 import os
-import re
+import tempfile
 import time
 import threading
 from collections import deque
@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import serial
 from serial.tools import list_ports
 
 if os.environ.get("DYSPHAGRIP_SNAPSHOT"):
@@ -17,9 +16,12 @@ if os.environ.get("DYSPHAGRIP_SNAPSHOT"):
     matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button
 
-from event_detector_live import SwallowEventDetector
+from event_detector_live import (
+    RECENT_EVENT_LIMIT, SwallowEventDetector, choose_arduino_port, read_arduino,
+)
+from label_capture import LabelCapture
 from validation import CATEGORIES, ExperimentLog, format_summary
 
 WINDOW_SECONDS = 5
@@ -30,16 +32,10 @@ AMBER = "#e2a63b"
 BG = "#0e1c22"
 PANEL = "#143039"
 AXIS_COLORS = ("#5ec8c8", "#8eb6ff", "#e0b07a")
-
-# Parse the existing Arduino output. The firmware is unchanged.
-IMU_LINE = re.compile(
-    r"Tilt X:\s*([-\d.]+)\s+"
-    r"Y:\s*([-\d.]+)\s+"
-    r"Z:\s*([-\d.]+)\s*\|\s*"
-    r"Turn X:\s*([-\d.]+)\s+"
-    r"Y:\s*([-\d.]+)\s+"
-    r"Z:\s*([-\d.]+)"
-)
+LABEL_COLOR = "#b7a1ff"
+LABEL_NAMES = {
+    "1": "Saliva", "2": "Agua", "3": "Hablar", "4": "Movimiento", "5": "Toser",
+}
 
 
 def find_contact_mic():
@@ -65,8 +61,13 @@ def signal_status(now, last_seen):
 
 
 def status_lines(now, detector_view, last_audio_at, last_imu_at, experiment_note=None):
+    audio_status = signal_status(now, last_audio_at)
+    imu_status = signal_status(now, last_imu_at)
     if detector_view["ready"]:
-        calibration = "Detection active"
+        if audio_status == imu_status == "Connected":
+            calibration = "Detection active"
+        else:
+            calibration = "Waiting for signal"
     else:
         remaining = max(
             0.0,
@@ -75,8 +76,8 @@ def status_lines(now, detector_view, last_audio_at, last_imu_at, experiment_note
         calibration = f"Calibrating ({remaining:.0f}s)"
 
     lines = [
-        f"Microphone    {signal_status(now, last_audio_at)}",
-        f"MPU6050       {signal_status(now, last_imu_at)}",
+        f"Microphone    {audio_status}",
+        f"MPU6050       {imu_status}",
         f"Detector      {calibration}",
     ]
     if experiment_note:
@@ -97,11 +98,11 @@ def status_lines(now, detector_view, last_audio_at, last_imu_at, experiment_note
     return lines
 
 
-def create_dashboard():
+def create_dashboard(experiment_mode=False):
     fig = plt.figure(figsize=(14.5, 8.2), facecolor=BG)
     grid = fig.add_gridspec(
         3, 4, width_ratios=(1.15, 1.15, 1.15, 0.95),
-        left=0.05, right=0.98, top=0.86, bottom=0.07, hspace=0.42, wspace=0.28,
+        left=0.05, right=0.98, top=0.83, bottom=0.07, hspace=0.42, wspace=0.28,
     )
     signal_axes = [fig.add_subplot(grid[row, :3]) for row in range(3)]
     history_ax = fig.add_subplot(grid[:, 3])
@@ -116,6 +117,21 @@ def create_dashboard():
         "Experimental monitor. Candidate events only — not a medical assessment.",
         color=MUTED, fontsize=9, ha="left", va="top",
     )
+    label_status = fig.text(
+        0.49, 0.955,
+        ("Etiqueta con tecla o botón · Audio y movimiento ±2 s"
+         if experiment_mode else "Modo monitor · Para etiquetar, inicia con --experiment"),
+        color=LABEL_COLOR if experiment_mode else MUTED,
+        fontsize=11, va="top",
+    )
+    buttons = {}
+    if experiment_mode:
+        for index, (key, name) in enumerate(LABEL_NAMES.items()):
+            area = fig.add_axes([0.49 + index * 0.099, 0.873, 0.093, 0.042])
+            button = Button(area, f"{key} · {name}", color=PANEL, hovercolor="#345558")
+            button.label.set_color(INK)
+            button.label.set_fontsize(10)
+            buttons[key] = button
 
     audio_line, = audio_axis.plot([], [], color=TEAL, lw=1.1)
     tilt_lines = [
@@ -173,13 +189,15 @@ def create_dashboard():
         "turn_lines": turn_lines,
         "counter_text": counter_text,
         "history_text": history_text,
+        "label_status": label_status,
+        "label_buttons": buttons,
         "event_artists": [],
     }
 
 
 def redraw(
     dashboard, audio, imu_rows, detector_view, last_audio_at, last_imu_at,
-    now=None, experiment_note=None,
+    now=None, experiment_note=None, manual_marks=(),
 ):
     now = time.monotonic() if now is None else float(now)
     for artist in dashboard["event_artists"]:
@@ -227,6 +245,19 @@ def redraw(
             color=AMBER, fontsize=8, ha="left", va="top",
             transform=dashboard["audio_axis"].transAxes,
         ))
+    for label, key in manual_marks:
+        position = label["time"] - now
+        if -WINDOW_SECONDS <= position <= 0:
+            for axis in dashboard["signal_axes"]:
+                dashboard["event_artists"].append(axis.axvline(
+                    position, color=LABEL_COLOR, lw=1.5, linestyle="--",
+                ))
+            dashboard["event_artists"].append(dashboard["audio_axis"].annotate(
+                f"#{label['id']} {LABEL_NAMES[key]}", xy=(position, 0.04),
+                xycoords=("data", "axes fraction"), xytext=(-3, 0),
+                textcoords="offset points", ha="right", color=LABEL_COLOR,
+                fontsize=8, clip_on=True,
+            ))
 
     dashboard["counter_text"].set_text(str(detector_view["event_count"]))
     dashboard["history_text"].set_text("\n".join(status_lines(
@@ -238,7 +269,7 @@ def redraw(
 def detector_view(detector):
     with detector.lock:
         return {
-            "events": list(detector.events),
+            "events": detector.events[-RECENT_EVENT_LIMIT:],
             "ready": detector.ready,
             "event_count": detector.event_count,
             "started": detector.start_time,
@@ -259,6 +290,8 @@ def main(argv=None):
         help="seconds allowed between a label and a detection (default 1.5)",
     )
     args = parser.parse_args(argv)
+    if not np.isfinite(args.tolerance) or args.tolerance < 0:
+        parser.error("--tolerance debe ser un número finito mayor o igual a cero.")
 
     audio_device, audio_dev = find_contact_mic()
     sample_rate = int(audio_dev["default_samplerate"])
@@ -275,17 +308,18 @@ def main(argv=None):
     stop_event = threading.Event()
     seen = {"audio": 0.0, "imu": 0.0}
 
-    ports = list(list_ports.comports())
-    for index, port in enumerate(ports):
-        print(f"{index}: {port.device} - {port.description}")
-    port_name = ports[int(input("Arduino port index: "))].device
+    port_name = choose_arduino_port(list(list_ports.comports()))
     detector = SwallowEventDetector(
-        csv_path=os.environ.get("DYSPHAGRIP_EVENTS", "dysphagrip_events.csv")
+        csv_path=os.environ.get("DYSPHAGRIP_EVENTS", "dysphagrip_events.csv"),
+        keep_session_events=args.experiment,
     )
     experiment = None
+    capture = None
+    audio_clock_offset = None
     if args.experiment:
         session = experiment_directory()
         experiment = ExperimentLog(session, tolerance=args.tolerance)
+        capture = LabelCapture(session, sample_rate)
         print("Experimental testing. Not a dysphagia diagnosis.")
         print("After the 5 second calibration, do one action and press its key:")
         print("  1 swallowing saliva")
@@ -293,14 +327,31 @@ def main(argv=None):
         print("  3 speaking")
         print("  4 head movement")
         print("  5 coughing")
-        print("Leave at least 3 seconds between actions. Close the window to score.")
+        print("Cada marca guarda 2 segundos de audio y movimiento antes y después.")
+        print("Deja al menos 5 segundos entre acciones y espera 2 segundos tras la última marca.")
         print(f"Match tolerance: {args.tolerance:.1f} s. Report: {session}")
 
     def audio_callback(indata, frames, time_info, status):
+        nonlocal audio_clock_offset
+        if stop_event.is_set():
+            return
+        stamp = time.monotonic()
         if status:
             print(status)
         chunk = np.array(indata[:, 0], copy=True)
-        seen["audio"] = time.monotonic()
+        seen["audio"] = stamp
+        if capture is not None:
+            adc = getattr(time_info, "inputBufferAdcTime", 0.0)
+            current = getattr(time_info, "currentTime", 0.0)
+            if 0 < adc <= current and np.isfinite(current):
+                # Anchor the stream clock once so callback scheduling jitter does
+                # not shift otherwise contiguous blocks on the label timeline.
+                if audio_clock_offset is None:
+                    audio_clock_offset = stamp - current
+                block_start = adc + audio_clock_offset
+            else:
+                block_start = stamp - frames / sample_rate
+            capture.add_audio(chunk, block_start)
         with audio_lock:
             if frames >= len(audio_buffer):
                 audio_buffer[:] = indata[-len(audio_buffer):, 0]
@@ -312,58 +363,77 @@ def main(argv=None):
         except Exception as error:
             print("Detector audio error:", error)
 
-    def read_arduino():
+    def on_imu(values):
+        if stop_event.is_set():
+            return
+        stamp = time.monotonic()
+        if capture is not None:
+            capture.add_imu(stamp, values)
+        with imu_lock:
+            seen["imu"] = stamp
+            imu_data.append((stamp, *values))
+        detector.on_imu(values[:3], values[3:], now=stamp)
+
+    reader_error = None
+
+    def monitor_arduino():
+        nonlocal reader_error
         try:
-            with serial.Serial(port_name, 115200, timeout=0.2) as arduino:
-                print("Arduino connected.")
-                while not stop_event.is_set():
-                    line = arduino.readline().decode("utf-8", errors="ignore").strip()
-                    match = IMU_LINE.search(line)
-                    if not match:
-                        continue
-                    values = [float(value) for value in match.groups()]
-                    stamp = time.monotonic()
-                    seen["imu"] = stamp
-                    with imu_lock:
-                        imu_data.append((stamp, *values))
-                    try:
-                        detector.on_imu(values[:3], values[3:])
-                    except Exception as error:
-                        print("Detector IMU error:", error)
+            read_arduino(port_name, stop_event, on_imu)
         except Exception as error:
-            print("Arduino error:", error)
+            reader_error = error
+            stop_event.set()
 
-    reader = threading.Thread(target=read_arduino, daemon=True)
-    reader.start()
-    dashboard = create_dashboard()
+    dashboard = create_dashboard(experiment_mode=experiment is not None)
+    recent_marks = deque()
 
-    def update(_frame):
+    def update():
+        if stop_event.is_set():
+            plt.close(dashboard["fig"])
+            return False
         with audio_lock:
             audio = audio_buffer.copy()
         with imu_lock:
             rows = list(imu_data)
+        now = time.monotonic()
+        if capture is not None:
+            capture.flush(now)
+        while recent_marks and recent_marks[0][0]["time"] < now - WINDOW_SECONDS:
+            recent_marks.popleft()
         redraw(
             dashboard, audio, rows, detector_view(detector),
             seen["audio"], seen["imu"],
-            experiment_note=None if experiment is None else experiment.note(),
+            now=now, manual_marks=recent_marks,
         )
-        return [dashboard["audio_line"], dashboard["history_text"]]
+        dashboard["fig"].canvas.draw_idle()
 
     if experiment is not None:
-        def on_key(event):
-            chosen = CATEGORIES.get(event.key)
-            if chosen is None:
+        def mark_action(key):
+            chosen = CATEGORIES.get(key)
+            if chosen is None or stop_event.is_set():
                 return
             category, title = chosen
             label = experiment.add_label(category)
+            capture.mark(label)
+            recent_marks.append((label, key))
+            clock = label["timestamp"].split("T")[1][:8]
+            dashboard["label_status"].set_text(
+                f"Marca #{label['id']} guardada · {LABEL_NAMES[key]} · {clock}"
+            )
+            update()
             print(f"Label {label['id']}: {title}")
 
-        dashboard["fig"].canvas.mpl_connect("key_press_event", on_key)
+        dashboard["fig"].canvas.mpl_connect(
+            "key_press_event", lambda event: mark_action(event.key)
+        )
+        for key, button in dashboard["label_buttons"].items():
+            button.on_clicked(lambda _event, key=key: mark_action(key))
 
-    animation = FuncAnimation(
-        dashboard["fig"], update, interval=100, cache_frame_data=False,
-    )
+    timer = dashboard["fig"].canvas.new_timer(interval=100)
+    timer.add_callback(update)
     snapshot_path = os.environ.get("DYSPHAGRIP_SNAPSHOT")
+    reader = threading.Thread(target=monitor_arduino, daemon=True)
+    reader.start()
     try:
         with sd.InputStream(
             device=audio_device,
@@ -376,32 +446,40 @@ def main(argv=None):
             if snapshot_path:
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline and not stop_event.is_set():
-                    update(0)
-                    dashboard["fig"].canvas.draw()
+                    update()
                     time.sleep(0.1)
-                dashboard["fig"].savefig(
-                    snapshot_path, dpi=130,
-                    facecolor=dashboard["fig"].get_facecolor(),
-                )
-                print(f"Snapshot: {snapshot_path}")
-            else:
+                if not stop_event.is_set():
+                    dashboard["fig"].savefig(
+                        snapshot_path, dpi=130,
+                        facecolor=dashboard["fig"].get_facecolor(),
+                    )
+                    print(f"Snapshot: {snapshot_path}")
+            elif not stop_event.is_set():
+                timer.start()
                 plt.show()
     finally:
         stop_event.set()
+        timer.stop()
         reader.join(timeout=1)
+        plt.close(dashboard["fig"])
         if experiment is not None:
-            summary = experiment.finish(
-                detector_view(detector)["events"],
-                ended=time.monotonic(),
-            )
-            print(format_summary(summary))
-    del animation
+            with detector.lock:
+                session_events = detector.events.copy()
+            ended = time.monotonic()
+            try:
+                capture.finish(ended)
+            finally:
+                summary = experiment.finish(session_events, ended=ended)
+                print(format_summary(summary))
+    if reader_error is not None:
+        raise SystemExit(f"Arduino: {reader_error}") from reader_error
     print("DysphaGrip stopped.")
 
 
-def experiment_directory():
+def experiment_directory(root=Path("experiments")):
+    root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("experiments") / stamp
+    return Path(tempfile.mkdtemp(prefix=f"{stamp}_", dir=root))
 
 
 if __name__ == "__main__":
