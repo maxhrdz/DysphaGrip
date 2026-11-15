@@ -61,6 +61,7 @@ Cada marca guarda el audio del micrófono y las seis lecturas de movimiento del 
 | 3 | Hablar |
 | 4 | Mover la cabeza |
 | 5 | Toser |
+| 6 | Reposo |
 
 Cierra la ventana para generar el informe. La terminal indica la carpeta de la sesión dentro de `experiments/`. Abre `summary.csv` para ver los aciertos, las falsas alarmas y las detecciones omitidas. Puedes revisar las etiquetas manuales en `ground_truth.csv`, las detecciones en `predictions.csv` y sus correspondencias en `matches.csv`. La tolerancia temporal predeterminada para comparar etiquetas y detecciones es de 1.5 segundos.
 
@@ -71,3 +72,28 @@ Dentro de esa misma sesión, abre `captures/mark_0001/` para revisar la primera 
 | `audio.wav` | Audio del micrófono de contacto a la frecuencia de muestreo de la sesión. |
 | `motion.csv` | Los tres ejes de aceleración y los tres de giro. El tiempo relativo vale cero al pulsar la marca. |
 | `metadata.json` | Etiqueta, tiempos y cobertura de los sensores. Permite comprobar si se capturó toda la ventana. |
+
+## Modelo piloto de audio
+
+El tablero puede mostrar dos detectores simultáneos. El contador principal sigue la regla de audio y movimiento. El segundo contador y sus líneas verdes corresponden a un clasificador de audio que busca patrones en ventanas sucesivas de un segundo. Ambos procesan la señal de forma independiente. El modelo corre localmente con NumPy.
+
+Con el Cherub en la entrada 1 de la M-Audio, el Arduino conectado y el entorno de Python activo, abre la primera comparación con este comando desde la carpeta del proyecto.
+
+```sh
+python sensor_fusion_live.py --record-session --audio-model models/audio_pilot.json
+```
+
+Este modo habilita las etiquetas y guarda el audio continuo del canal de contacto en la carpeta local de la sesión mientras el detector está calibrado y llegan datos de ambos sensores. La opción existente `--experiment` sigue guardando las ventanas de las marcas. Para ver el modelo sin guardar el audio continuo, usa únicamente `--audio-model models/audio_pilot.json`.
+
+1. Espera a que ambos sensores indiquen `Connected` y aparezca `Detection active`. Comprueba la frecuencia del Arduino con el diagnóstico descrito arriba antes de la prueba.
+2. Alterna acciones y márcalas inmediatamente después. Para una primera sesión de prueba, procura registrar cinco ejemplos separados de saliva, habla, movimiento de cabeza, tos y reposo. Para reposo, permanece quieto unos segundos y pulsa `6`. Deja al menos cinco segundos entre marcas y dos segundos antes de cerrar. Marca todas las acciones para poder interpretar las falsas alarmas.
+3. Cierra el tablero. La terminal imprime los aciertos, las omisiones y las falsas alarmas por minuto de ambos detectores. En la carpeta de la sesión, abre `audio_comparison.png` para ver las marcas manuales y las detecciones, o `audio_comparison.json` para revisar los tiempos y las métricas. El cálculo comprende solo los tramos con señal evaluable para ambos detectores.
+
+El modelo piloto se entrenó con marcas de una sola sesión. Guarda sesiones completas distintas para entrenamiento y evaluación. Para entrenar otra versión usa una ruta nueva de salida y repite `--session` por cada sesión de entrenamiento. Reserva una sesión grabada con `--record-session` para comparar. Los nombres en mayúsculas son ejemplos que debes sustituir.
+
+```sh
+python train_audio_model.py train --session experiments/ENTRENAMIENTO --model models/mi_modelo.json
+python train_audio_model.py compare --session experiments/PRUEBA --model models/mi_modelo.json
+```
+
+Las marcas son referencias manuales. Un candidato indica que la señal se parece a un ejemplo etiquetado. La capacidad de recuperar acciones nuevas se mide en la sesión reservada.

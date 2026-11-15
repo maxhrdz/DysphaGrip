@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import tempfile
 import time
@@ -18,11 +19,14 @@ if os.environ.get("DYSPHAGRIP_SNAPSHOT"):
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
+from audio_model import AudioModel, AudioStreamDetector
+from session_audio import SessionAudioRecorder
 from event_detector_live import (
     RECENT_EVENT_LIMIT, SwallowEventDetector, choose_arduino_port, read_arduino,
 )
 from label_capture import LabelCapture
-from validation import CATEGORIES, ExperimentLog, format_summary
+from train_audio_model import compare_session
+from validation import CATEGORIES, POSITIVE_CATEGORIES, ExperimentLog, format_summary
 
 WINDOW_SECONDS = 5
 INK = "#e7f4f4"
@@ -34,7 +38,7 @@ PANEL = "#143039"
 AXIS_COLORS = ("#5ec8c8", "#8eb6ff", "#e0b07a")
 LABEL_COLOR = "#b7a1ff"
 LABEL_NAMES = {
-    "1": "Saliva", "2": "Agua", "3": "Hablar", "4": "Movimiento", "5": "Toser",
+    "1": "Saliva", "2": "Agua", "3": "Hablar", "4": "Movimiento", "5": "Toser", "6": "Reposo",
 }
 
 
@@ -127,7 +131,7 @@ def create_dashboard(experiment_mode=False):
     buttons = {}
     if experiment_mode:
         for index, (key, name) in enumerate(LABEL_NAMES.items()):
-            area = fig.add_axes([0.49 + index * 0.099, 0.873, 0.093, 0.042])
+            area = fig.add_axes([0.48 + index * 0.085, 0.873, 0.080, 0.042])
             button = Button(area, f"{key} · {name}", color=PANEL, hovercolor="#345558")
             button.label.set_color(INK)
             button.label.set_fontsize(10)
@@ -277,6 +281,46 @@ def detector_view(detector):
         }
 
 
+def save_audio_comparison(session, model):
+    report = compare_session(model, session)
+    (session / "audio_comparison.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8",
+    )
+    timeline = report["timeline"]
+    origin = timeline["origin"]
+    fig, axis = plt.subplots(figsize=(11, 4.2), layout="constrained")
+    try:
+        marks = timeline["marks"]
+        rows = [
+            ("Marcas de deglución", [m["time"] for m in marks if m["category"] in POSITIVE_CATEGORIES], "#175d82"),
+            ("Marcas de control", [m["time"] for m in marks if m["category"] not in POSITIVE_CATEGORIES], "#696b75"),
+            ("Regla de los sensores", timeline["rule"], "#ac6300"),
+            ("Modelo de audio", timeline["audio"], "#21835e"),
+        ]
+        for i, (_, times, color) in enumerate(rows):
+            axis.scatter([t - origin for t in times], [i] * len(times), color=color,
+                         marker="|", s=150, linewidths=2)
+        intervals = timeline["intervals"]
+        for (_, end), (start, _) in zip(intervals, intervals[1:]):
+            axis.axvspan(end - origin, start - origin, color="#c8c8c8", alpha=0.5)
+        axis.set_xlim(-0.1, intervals[-1][1] - origin + 0.1)
+        axis.set_yticks(range(len(rows)), [row[0] for row in rows])
+        axis.set_ylim(3.6, -0.6)
+        axis.set_xlabel("Segundos desde el inicio del primer tramo evaluado")
+        axis.set_title("Marcas manuales y candidatos en una sesión independiente")
+        axis.grid(axis="x", alpha=0.2)
+        fig.savefig(session / "audio_comparison.png", dpi=130)
+    finally:
+        plt.close(fig)
+    print(f"Comparación sobre {report['scored_seconds']:.1f} s. "
+          f"Marcas evaluadas: {report['scored_labels']}; fuera de cobertura: {report['excluded_labels']}.")
+    for key, name in (("detector_actual", "Regla"), ("modelo_audio", "IA de audio")):
+        metrics = report[key]
+        print(f"{name}: {metrics['true_positives']} aciertos, {metrics['false_negatives']} omisiones, "
+              f"{metrics['false_positives_per_minute']:.2f} falsas alarmas/min")
+    print(f"Comparación guardada en {session / 'audio_comparison.png'}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="DysphaGrip live monitor. Add --experiment to label a session.",
@@ -289,7 +333,16 @@ def main(argv=None):
         "--tolerance", type=float, default=1.5,
         help="seconds allowed between a label and a detection (default 1.5)",
     )
+    parser.add_argument("--audio-model", type=Path, metavar="MODELO.json",
+                        help="mostrar también los candidatos del modelo piloto de audio")
+    parser.add_argument("--record-session", action="store_true",
+                        help="activar el experimento y guardar audio continuo para comparar ambos detectores")
     args = parser.parse_args(argv)
+    args.experiment = args.experiment or args.record_session
+    try:
+        model = AudioModel.load(args.audio_model) if args.audio_model else None
+    except (ValueError, OSError) as error:
+        parser.error(f"No se pudo abrir el modelo de audio: {error}")
     if not np.isfinite(args.tolerance) or args.tolerance < 0:
         parser.error("--tolerance debe ser un número finito mayor o igual a cero.")
 
@@ -307,6 +360,14 @@ def main(argv=None):
     imu_lock = threading.Lock()
     stop_event = threading.Event()
     seen = {"audio": 0.0, "imu": 0.0}
+
+    audio_ai = AudioStreamDetector(model, sample_rate) if model is not None else None
+    # The UI drains these blocks outside PortAudio. Timestamps expose any gap
+    # when an unusually slow redraw exhausts the five-second backlog.
+    ai_pending = deque(maxlen=max(2, int(np.ceil(sample_rate * 5 / 1024))))
+    ai_count = 0
+    ai_recent = deque()
+    recording = None
 
     port_name = choose_arduino_port(list(list_ports.comports()))
     detector = SwallowEventDetector(
@@ -327,6 +388,9 @@ def main(argv=None):
         print("  3 speaking")
         print("  4 head movement")
         print("  5 coughing")
+        print("  6 rest")
+        if args.record_session:
+            print("Se guardará audio continuo local mientras el detector y ambos sensores estén activos.")
         print("Cada marca guarda 2 segundos de audio y movimiento antes y después.")
         print("Deja al menos 5 segundos entre acciones y espera 2 segundos tras la última marca.")
         print(f"Match tolerance: {args.tolerance:.1f} s. Report: {session}")
@@ -340,7 +404,7 @@ def main(argv=None):
             print(status)
         chunk = np.array(indata[:, 0], copy=True)
         seen["audio"] = stamp
-        if capture is not None:
+        if capture is not None or audio_ai is not None:
             adc = getattr(time_info, "inputBufferAdcTime", 0.0)
             current = getattr(time_info, "currentTime", 0.0)
             if 0 < adc <= current and np.isfinite(current):
@@ -351,7 +415,14 @@ def main(argv=None):
                 block_start = adc + audio_clock_offset
             else:
                 block_start = stamp - frames / sample_rate
-            capture.add_audio(chunk, block_start)
+            if capture is not None:
+                capture.add_audio(chunk, block_start)
+            if detector.ready and signal_status(stamp, seen["imu"]) == "Connected" and not status:
+                if recording is not None:
+                    recording.add_audio(chunk, block_start)
+                if audio_ai is not None:
+                    with audio_lock:
+                        ai_pending.append((block_start, chunk))
         with audio_lock:
             if frames >= len(audio_buffer):
                 audio_buffer[:] = indata[-len(audio_buffer):, 0]
@@ -385,14 +456,25 @@ def main(argv=None):
             stop_event.set()
 
     dashboard = create_dashboard(experiment_mode=experiment is not None)
+    if audio_ai is not None:
+        dashboard["ai_status"] = dashboard["fig"].text(
+            0.05, 0.873, "IA piloto (audio) · esperando señal", fontsize=9, color="#80df98",
+        )
     recent_marks = deque()
 
     def update():
+        nonlocal ai_count
         if stop_event.is_set():
             plt.close(dashboard["fig"])
             return False
         with audio_lock:
             audio = audio_buffer.copy()
+            pending = list(ai_pending)
+            ai_pending.clear()
+        for block_start, chunk in pending:
+            times = audio_ai.feed(chunk, block_start)
+            ai_count += len(times)
+            ai_recent.extend(times)
         with imu_lock:
             rows = list(imu_data)
         now = time.monotonic()
@@ -405,12 +487,26 @@ def main(argv=None):
             seen["audio"], seen["imu"],
             now=now, manual_marks=recent_marks,
         )
+        if audio_ai is not None:
+            while ai_recent and ai_recent[0] < now - WINDOW_SECONDS:
+                ai_recent.popleft()
+            for candidate in ai_recent:
+                dashboard["event_artists"].append(dashboard["audio_axis"].axvline(
+                    candidate - now, color="#80df98", ls=":", lw=1.6,
+                ))
+            dashboard["ai_status"].set_text(f"IA piloto (audio) · candidatos: {ai_count} · línea verde")
         dashboard["fig"].canvas.draw_idle()
 
     if experiment is not None:
         def mark_action(key):
             chosen = CATEGORIES.get(key)
             if chosen is None or stop_event.is_set():
+                return
+            if args.record_session and (not detector.ready or any(
+                signal_status(time.monotonic(), last) != "Connected" for last in seen.values()
+            )):
+                dashboard["label_status"].set_text("Espera la calibración y la señal de ambos sensores.")
+                dashboard["fig"].canvas.draw_idle()
                 return
             category, title = chosen
             label = experiment.add_label(category)
@@ -435,6 +531,8 @@ def main(argv=None):
     reader = threading.Thread(target=monitor_arduino, daemon=True)
     reader.start()
     try:
+        if args.record_session:
+            recording = SessionAudioRecorder(session, sample_rate)
         with sd.InputStream(
             device=audio_device,
             channels=audio_channels,
@@ -467,10 +565,19 @@ def main(argv=None):
                 session_events = detector.events.copy()
             ended = time.monotonic()
             try:
-                capture.finish(ended)
+                try:
+                    capture.finish(ended)
+                finally:
+                    if recording is not None:
+                        recording.close()
             finally:
                 summary = experiment.finish(session_events, ended=ended)
                 print(format_summary(summary))
+    if args.record_session and model is not None:
+        try:
+            save_audio_comparison(session, model)
+        except (OSError, ValueError) as error:
+            print(f"Comparación pendiente: {error}")
     if reader_error is not None:
         raise SystemExit(f"Arduino: {reader_error}") from reader_error
     print("DysphaGrip stopped.")

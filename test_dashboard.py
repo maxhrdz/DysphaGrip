@@ -91,6 +91,61 @@ class DashboardStatusTests(unittest.TestCase):
             self.assertEqual([float(row["seconds_from_mark"]) for row in rows], [-0.25, 0.25])
             self.assertEqual([float(row["tilt_x"]) for row in rows], [0.0, 0.1])
 
+    def test_model_observes_audio_without_a_rule_detection_and_records_rest(self):
+        board = dashboard.create_dashboard(experiment_mode=True)
+        canvas = board["fig"].canvas
+        port = SimpleNamespace(device="test-port", description="Arduino")
+        mic = {"default_samplerate": 48000, "max_input_channels": 1, "name": "test"}
+        reader_started = threading.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            # A fixed positive test model exercises streaming, disk replay and
+            # comparison independently of the predictive quality of the pilot.
+            from audio_model import AudioModel, FEATURE_NAMES
+            size = len(FEATURE_NAMES)
+            AudioModel(np.zeros(size), np.ones(size), np.zeros(size), 10,
+                       ["test-training-session"]).save(folder / "pilot.json")
+
+            def simulate_session():
+                self.assertTrue(reader_started.wait(timeout=2))
+                receive_imu = reader.call_args.args[2]
+                receive_audio = stream.call_args.kwargs["callback"]
+                data = np.zeros((1024, 1), dtype=np.float32)
+                for i in range(115):
+                    start = 102 + i * 1024 / 48000
+                    clock.return_value = start + 1024 / 48000
+                    if i % 4 == 0:
+                        receive_imu((0, 0, 1, 0, 0, 0))
+                    receive_audio(data, 1024, SimpleNamespace(), None)
+                    if i == 80:
+                        canvas.callbacks.process("key_press_event", KeyEvent("key_press_event", canvas, key="6"))
+
+            with (
+                patch.dict(dashboard.os.environ, {"DYSPHAGRIP_EVENTS": str(folder/"events.csv"),
+                                                 "DYSPHAGRIP_SNAPSHOT": ""}),
+                patch.object(dashboard, "find_contact_mic", return_value=(0, mic)),
+                patch.object(dashboard.list_ports, "comports", return_value=[port]),
+                patch.object(dashboard, "experiment_directory", return_value=folder),
+                patch.object(dashboard, "create_dashboard", return_value=board),
+                patch.object(dashboard, "SwallowEventDetector", side_effect=lambda **kw: ready_detector(**kw)[0]),
+                patch.object(dashboard, "read_arduino", side_effect=lambda *_: reader_started.set()) as reader,
+                patch.object(dashboard.sd, "InputStream") as stream,
+                patch.object(dashboard.time, "monotonic", return_value=100.0) as clock,
+                patch.object(dashboard.plt, "show", side_effect=simulate_session),
+            ):
+                dashboard.main(["--record-session", "--audio-model", str(folder / "pilot.json")])
+            self.assertIn("candidatos: 1", board["ai_status"].get_text())
+            self.assertEqual(board["counter_text"].get_text(), "0")
+            import json
+            result = json.loads((folder / "audio_comparison.json").read_text())
+            self.assertEqual(result["scored_labels"], 1)
+            self.assertEqual(result["modelo_audio"]["false_positives"], 1)
+            self.assertEqual(result["detector_actual"]["false_positives"], 0)
+            self.assertTrue((folder / "audio_comparison.png").is_file())
+            with (folder / "ground_truth.csv").open() as f:
+                self.assertEqual(next(csv.DictReader(f))["category"], "rest")
+            self.assertTrue((folder / "session_audio.json").exists())
+
     def test_experiment_keys_and_click_save_and_display_manual_marks(self):
         board = dashboard.create_dashboard(experiment_mode=True)
         canvas = board["fig"].canvas

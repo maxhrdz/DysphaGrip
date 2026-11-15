@@ -19,6 +19,7 @@ CATEGORIES = {
     "3": ("speaking", "Speaking"),
     "4": ("head_movement", "Head movement"),
     "5": ("coughing", "Coughing"),
+    "6": ("rest", "Rest"),
 }
 
 POSITIVE_CATEGORIES = {"swallowing_saliva", "swallowing_water"}
@@ -178,7 +179,7 @@ class ExperimentLog:
 
     def add_label(self, category, when=None):
         if category not in POSITIVE_CATEGORIES and category not in {
-            "speaking", "head_movement", "coughing",
+            "speaking", "head_movement", "coughing", "rest",
         }:
             raise ValueError(f"Unknown category: {category}")
         moment = time.monotonic() if when is None else float(when)
