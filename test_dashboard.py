@@ -32,6 +32,16 @@ def ready_detector(csv_path, **kwargs):
 
 
 class DashboardStatusTests(unittest.TestCase):
+    def test_recent_voice_estimate_expires_and_releases_on_other_activity(self):
+        history = [(1.00, "speaking"), (1.25, "speaking")]
+        self.assertEqual(dashboard.displayed_activity("uncertain", 1.51, history), "speaking")
+        self.assertEqual(dashboard.displayed_activity("uncertain", 1.51,
+                         [(1.00, "coughing"), (1.25, "coughing")]), "uncertain")
+        self.assertEqual(dashboard.displayed_activity("swallowing", 1.51, history), "swallowing")
+        self.assertEqual(dashboard.displayed_activity("uncertain", 2.20, history), "uncertain")
+        self.assertEqual(dashboard.displayed_activity("uncertain", 1.51,
+                         [(1.00, "speaking"), (1.25, "coughing")]), "uncertain")
+
     def test_manual_label_saves_both_sensor_streams_with_zero_detections(self):
         board = dashboard.create_dashboard(experiment_mode=True)
         canvas = board["fig"].canvas
@@ -131,10 +141,19 @@ class DashboardStatusTests(unittest.TestCase):
                 patch.object(dashboard, "read_arduino", side_effect=lambda *_: reader_started.set()) as reader,
                 patch.object(dashboard.sd, "InputStream") as stream,
                 patch.object(dashboard.time, "monotonic", return_value=100.0) as clock,
+                patch.object(dashboard.MotionCoughSpecialist, "predict", return_value=("head_movement", 0.85)) as motion_prediction,
                 patch.object(dashboard.plt, "show", side_effect=simulate_session),
             ):
                 dashboard.main(["--record-session", "--audio-model", str(folder / "pilot.json")])
+            self.assertTrue(motion_prediction.called)
             self.assertIn("candidatos: 1", board["ai_status"].get_text())
+            self.assertIn("Head movement", board["activity_text"].get_text())
+            with (folder / "activity_at_marks.csv").open() as file:
+                mark = next(csv.DictReader(file))
+                self.assertEqual(mark["manual_activity"], "rest")
+                self.assertEqual(mark["displayed_activity"], "waiting")  # first UI update followed this mark
+            with (folder / "activity_predictions.csv").open() as file:
+                self.assertEqual(next(csv.DictReader(file))["estimated_activity"], "head_movement")
             self.assertEqual(board["counter_text"].get_text(), "0")
             import json
             result = json.loads((folder / "audio_comparison.json").read_text())
@@ -210,7 +229,8 @@ class DashboardStatusTests(unittest.TestCase):
         self.assertIn("Microphone    Connected", lines)
         self.assertIn("MPU6050       Connected", lines)
         self.assertIn("Detector      Detection active", lines)
-        self.assertIn("Possible Swallow Event Detected", lines)
+        self.assertIn("RMS", lines)
+        self.assertNotIn("Swallow", lines)
         self.assertNotIn("Safe Swallow", lines)
         self.assertNotIn("Aspiration", lines)
 

@@ -31,7 +31,7 @@ La suite simula las entradas y escribe los resultados en carpetas temporales. Al
    Tilt X: -0.99 Y: 0.00 Z: 0.20 | Turn X: 1.00 Y: 2.00 Z: 3.00
    ```
 
-3. Cierra el monitor serie del Arduino y ejecuta `python sensor_fusion_live.py` para abrir el tablero. Si se solicita, elige el número del puerto del Arduino. Mantén los sensores quietos y el entorno en silencio hasta que aparezca `Detection active`. La calibración dura al menos cinco segundos.
+3. Cierra el monitor serie del Arduino y ejecuta `python sensor_fusion_live.py --desktop` para abrir el tablero de escritorio. Si se solicita, elige el número del puerto del Arduino. Mantén los sensores quietos y el entorno en silencio hasta que aparezca `Detection active`. La calibración dura al menos cinco segundos.
 4. Comprueba que el tablero muestre `Connected` para el micrófono y el MPU6050. Verifica por separado que hablar cerca del micrófono o rozarlo suavemente cambia la gráfica de audio, y que mover el MPU6050 cambia las gráficas de movimiento. Cierra la ventana al terminar.
 
 Si prefieres ver los eventos en la terminal, ejecuta `python event_detector_live.py` y detén la sesión con `Ctrl+C`. Ambos modos agregan los eventos al historial `dysphagrip_events.csv` en la carpeta de ejecución.
@@ -73,6 +73,40 @@ Dentro de esa misma sesión, abre `captures/mark_0001/` para revisar la primera 
 | `motion.csv` | Los tres ejes de aceleración y los tres de giro. El tiempo relativo vale cero al pulsar la marca. |
 | `metadata.json` | Etiqueta, tiempos y cobertura de los sensores. Permite comprobar si se capturó toda la ventana. |
 
+## Identificar la actividad en el tablero
+
+Con ambos sensores conectados, ejecuta el siguiente comando y pulsa **Record** en el navegador:
+
+```sh
+python sensor_fusion_live.py --record-session
+```
+
+El panel **Activity estimate** muestra la estimación automática del último segundo de audio y movimiento: **Swallowing**, **Speaking**, **Head movement**, **Coughing** o **Rest**. El modelo agrupa saliva y agua como deglución. **Uncertain** indica que las señales son ambiguas o que la ventana tiene pocas lecturas de movimiento. **Waiting for signal** aparece al arrancar, durante la calibración o al interrumpirse la señal.
+
+El modelo predeterminado `models/activity_voice_cough.json` usa las vibraciones periódicas y los cambios rápidos de energía para distinguir habla y tos. Si la duda incluye otra actividad, mantiene la incertidumbre. Se puede volver al modelo anterior con `--activity-model models/activity_pilot.json`.
+
+Cuando aparecen dos estimaciones seguidas de habla y a continuación una ventana ambigua, el tablero puede mostrar **Speaking (recent)** durante esa actualización, hasta medio segundo después de la última estimación clara. Después de una tos, una ventana ambigua vuelve inmediatamente a **Uncertain**. Una nueva estimación clara aparece de inmediato. En una sesión grabada, `activity_at_marks.csv` guarda tanto la acción marcada como la estimación que mostraba el tablero al pulsar. En `activity_predictions.csv`, las columnas `estimated_activity` y `displayed_activity` distinguen el cálculo de la ventana y el texto visible.
+
+El ajuste de movimiento y tos compara cómo sube el sonido del micrófono con la intensidad y la dirección del giro que registra el MPU6050. Se aplica cuando el modelo principal propone movimiento de cabeza o tos. Puedes comparar con la versión anterior añadiendo `--no-motion-cough` al comando del tablero. En `activity_at_marks.csv`, revisa las columnas `manual_activity` y `displayed_activity` para saber qué viste al pulsar.
+
+El contador **Candidate events** del navegador (**Audio + motion triggers** en el escritorio) muestra cuántas veces ambas señales superaron sus umbrales. Las teclas registran por separado la acción que realmente hiciste. En una sesión grabada, `activity_predictions.csv` guarda las estimaciones en vivo con el instante final de cada ventana. Al cerrar, `activity_report.json` compara la predicción del segundo anterior a cada marca con la acción indicada, e informa por categoría los aciertos, confusiones y resultados inciertos. Para elegir otro modelo de actividades se puede pasar `--activity-model ruta/modelo.json`.
+
+Para evaluar el ajuste específico de habla y tos, el entrenador también acepta `--voice-baseline models/activity_pilot.json`. Esta opción conserva el clasificador original y entrena con ejemplos de habla y tos un segundo clasificador que mide periodicidad y cambios de energía. Indica un modelo de salida distinto del original y pasa las carpetas de las sesiones de entrenamiento originales junto con las nuevas. El informe incluye una comparación con los mismos pesos de partida.
+
+Para entrenar otra versión y medir los aciertos por actividad, pasa las carpetas de al menos dos sesiones terminadas con capturas etiquetadas. Sustituye los nombres de ejemplo y usa un archivo de salida nuevo para conservar el piloto.
+
+```sh
+python train_activity_model.py --session experiments/SESION_A --session experiments/SESION_B --model models/actividades_v2.json --report experiments/validacion_actividades_v2.json
+```
+
+Para reproducir la revisión de tos y movimiento de las 10:34, el siguiente comando genera un modelo y un informe nuevos en la carpeta local de experimentos. Reserva las marcas finales a partir de la 17 y reproduce las ventanas que se mostraban al pulsar las teclas.
+
+```sh
+python train_motion_cough.py --primary models/activity_voice_cough.json --test-session experiments/20261115_103418_7n_erac4 --first-test-mark 17 --model experiments/motion_cough_retrained.json --report experiments/motion_cough_retrained_report.json --replay --development-session
+```
+
+El informe de `train_activity_model.py` prueba cada sesión con un modelo entrenado en las demás. También mide por separado el tramo final de la sesión más reciente, después de entrenar con su tramo inicial y las sesiones anteriores. Las cifras se calculan sobre las acciones marcadas. El modelo final utiliza todas las capturas válidas.
+
 ## Modelo piloto de audio
 
 El tablero puede mostrar dos detectores simultáneos. El contador principal sigue la regla de audio y movimiento. El segundo contador y sus líneas verdes corresponden a un clasificador de audio que busca patrones en ventanas sucesivas de un segundo. Ambos procesan la señal de forma independiente. El modelo corre localmente con NumPy.
@@ -97,3 +131,28 @@ python train_audio_model.py compare --session experiments/PRUEBA --model models/
 ```
 
 Las marcas son referencias manuales. Un candidato indica que la señal se parece a un ejemplo etiquetado. La capacidad de recuperar acciones nuevas se mide en la sesión reservada.
+
+## Browser monitor
+
+The local web app uses `python web_monitor.py` on port 8770. When the app launcher is running, it manages this process. The service starts idle. **Record** opens the M-Audio input and Arduino serial port and waits for samples from both. Close the desktop or Arduino Serial Monitor before starting. When multiple boards are attached, set `DYSPHAGRIP_ARDUINO_PORT` to the intended serial device before launching. In standby, USB detection refreshes every two seconds. The detected Arduino port indicates that the board is visible. The MPU6050 shows a live signal only after valid six-axis messages arrive. If no port appears, use a USB data cable and retry after the board finishes booting.
+
+Wait for calibration to label an activity. The browser shows the activity model used by the desktop monitor and plots the recent contact audio and motion. **Stop** finalizes the local files in `experiments/` and then publishes `web_recording.json` for the history page. Wait for the stopped state before starting a new session or exiting the app.
+
+### Opening the English dashboard on macOS
+
+For a fresh checkout, install Python 3.13 and Node.js 22 or 24 with npm. Clone the two branches into the same parent folder, then start the dashboard from the sensor project.
+
+```sh
+git clone --branch ai https://github.com/maxhrdz/test2.git prueba2
+git clone --branch webpage https://github.com/XxPosedd/dysphagrip.git dysphagrip
+cd prueba2
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+./"Open DysphaGrip.command"
+```
+
+The launcher installs the web dependencies on first use. If the repositories are stored separately, set `DYSPHAGRIP_WEB_ROOT` to the web checkout. Use **Configure providers.command** to enter your Bright Data token and zone, ElevenLabs key and voice ID, and Neon connection string.
+
+Double-click **Open DysphaGrip.command** or run `/opt/anaconda3/bin/python sensor_fusion_live.py --record-session`. The dashboard opens at **http://127.0.0.1:5173**. Click **Record** with the M-Audio interface and Arduino connected. Click **Stop** to finalize the session. Keep the launcher running while using the dashboard. The original Matplotlib monitor opens with `--desktop --record-session`.
+
+The research library retrieves journal metadata through Bright Data Web Unlocker and links to PubMed. New browser recordings save a summary to Neon; audio, movement and labels stay on the Mac. **Configure providers.command** stores provider settings privately. A connected ElevenLabs API key and voice ID enable the two English recording announcements. macOS supplies the backup voice. **Claim Neon database.command** opens the temporary database claim flow. After claiming, enter the new Neon connection string in **Configure providers.command** and restart the launcher.

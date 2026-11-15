@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import os
 import tempfile
@@ -18,7 +19,11 @@ if os.environ.get("DYSPHAGRIP_SNAPSHOT"):
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 
+from activity_model import ActivityModel, InsufficientMotion, extract_activity_features, extract_voice_features
+from motion_cough import MotionCoughSpecialist, extract_motion_cough_features
 from audio_model import AudioModel, AudioStreamDetector
 from session_audio import SessionAudioRecorder
 from event_detector_live import (
@@ -40,6 +45,26 @@ LABEL_COLOR = "#b7a1ff"
 LABEL_NAMES = {
     "1": "Saliva", "2": "Agua", "3": "Hablar", "4": "Movimiento", "5": "Toser", "6": "Reposo",
 }
+
+
+ACTIVITY_NAMES = {
+    "swallowing": "Swallowing", "head_movement": "Head movement", "coughing": "Coughing",
+    "speaking": "Speaking", "rest": "Rest", "uncertain": "Uncertain",
+}
+DEFAULT_ACTIVITY_MODEL = Path(__file__).resolve().parent / "models" / "activity_voice_cough.json"
+
+
+DEFAULT_MOTION_COUGH = DEFAULT_ACTIVITY_MODEL.with_name("motion_cough.json")
+
+
+def displayed_activity(category, window_end, previous):
+    """Keep one ambiguous update readable after two consecutive speech estimates."""
+    if category == "uncertain" and len(previous) == 2:
+        (first_end, first), (last_end, last) = previous
+        if (first == last == "speaking"
+                and 0 < last_end - first_end <= 0.5 and 0 < window_end - last_end <= 0.5):
+            return last
+    return category
 
 
 def find_contact_mic():
@@ -98,7 +123,6 @@ def status_lines(now, detector_view, last_audio_at, last_imu_at, experiment_note
         lines.append(
             f"   RMS {event['rms']:.4f}   IMU {event['imu_activity']:.2f}"
         )
-        lines.append("   Possible Swallow Event Detected")
     return lines
 
 
@@ -170,16 +194,18 @@ def create_dashboard(experiment_mode=False):
     history_ax.set_yticks([])
     for spine in history_ax.spines.values():
         spine.set_color("#24555c")
+    activity_text = history_ax.text(0.06, 0.96, "Activity estimate\nWaiting for signal",
+                                    color=INK, fontsize=14, va="top", transform=history_ax.transAxes)
     counter_text = history_ax.text(
-        0.06, 0.96, "0", color=TEAL, fontsize=32, fontweight="medium",
+        0.06, 0.80, "0", color=TEAL, fontsize=19, fontweight="medium",
         va="top", ha="left", transform=history_ax.transAxes,
     )
     history_ax.text(
-        0.06, 0.86, "Possible events", color=MUTED, fontsize=10,
+        0.06, 0.74, "Audio + motion triggers", color=MUTED, fontsize=10,
         va="top", ha="left", transform=history_ax.transAxes,
     )
     history_text = history_ax.text(
-        0.06, 0.78, "", color=INK, fontsize=9, va="top", ha="left",
+        0.06, 0.68, "", color=INK, fontsize=9, va="top", ha="left",
         transform=history_ax.transAxes, linespacing=1.4,
     )
     return {
@@ -192,6 +218,7 @@ def create_dashboard(experiment_mode=False):
         "tilt_lines": tilt_lines,
         "turn_lines": turn_lines,
         "counter_text": counter_text,
+        "activity_text": activity_text,
         "history_text": history_text,
         "label_status": label_status,
         "label_buttons": buttons,
@@ -245,7 +272,7 @@ def redraw(
             )
     if visible:
         dashboard["event_artists"].append(dashboard["audio_axis"].text(
-            0.02, 0.90, "Possible Swallow Event Detected",
+            0.02, 0.90, "Audio + motion trigger",
             color=AMBER, fontsize=8, ha="left", va="top",
             transform=dashboard["audio_axis"].transAxes,
         ))
@@ -281,6 +308,23 @@ def detector_view(detector):
         }
 
 
+def save_activity_report(session, activity_model, motion_cough):
+    from train_activity_model import evaluate_activity_session
+
+    if motion_cough is None:
+        report = evaluate_activity_session(activity_model, session)
+    else:
+        from train_motion_cough import evaluate_motion_cough_session
+        report = evaluate_motion_cough_session(activity_model, motion_cough, session)
+    (session / "activity_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    metrics = report["metrics"]
+    print(f"Actividades: {metrics['correct']}/{metrics['examples']} marcas correctas, "
+          f"{metrics['uncertain']} inciertas. Informe: {session / 'activity_report.json'}")
+
+
 def save_audio_comparison(session, model):
     report = compare_session(model, session)
     (session / "audio_comparison.json").write_text(
@@ -288,30 +332,30 @@ def save_audio_comparison(session, model):
     )
     timeline = report["timeline"]
     origin = timeline["origin"]
-    fig, axis = plt.subplots(figsize=(11, 4.2), layout="constrained")
-    try:
-        marks = timeline["marks"]
-        rows = [
-            ("Marcas de deglución", [m["time"] for m in marks if m["category"] in POSITIVE_CATEGORIES], "#175d82"),
-            ("Marcas de control", [m["time"] for m in marks if m["category"] not in POSITIVE_CATEGORIES], "#696b75"),
-            ("Regla de los sensores", timeline["rule"], "#ac6300"),
-            ("Modelo de audio", timeline["audio"], "#21835e"),
-        ]
-        for i, (_, times, color) in enumerate(rows):
-            axis.scatter([t - origin for t in times], [i] * len(times), color=color,
-                         marker="|", s=150, linewidths=2)
-        intervals = timeline["intervals"]
-        for (_, end), (start, _) in zip(intervals, intervals[1:]):
-            axis.axvspan(end - origin, start - origin, color="#c8c8c8", alpha=0.5)
-        axis.set_xlim(-0.1, intervals[-1][1] - origin + 0.1)
-        axis.set_yticks(range(len(rows)), [row[0] for row in rows])
-        axis.set_ylim(3.6, -0.6)
-        axis.set_xlabel("Segundos desde el inicio del primer tramo evaluado")
-        axis.set_title("Marcas manuales y candidatos en una sesión independiente")
-        axis.grid(axis="x", alpha=0.2)
-        fig.savefig(session / "audio_comparison.png", dpi=130)
-    finally:
-        plt.close(fig)
+    # This export also runs on the browser monitor's recording thread.
+    fig = Figure(figsize=(11, 4.2), layout="constrained")
+    FigureCanvasAgg(fig)
+    axis = fig.subplots()
+    marks = timeline["marks"]
+    rows = [
+        ("Marcas de deglución", [m["time"] for m in marks if m["category"] in POSITIVE_CATEGORIES], "#175d82"),
+        ("Marcas de control", [m["time"] for m in marks if m["category"] not in POSITIVE_CATEGORIES], "#696b75"),
+        ("Regla de los sensores", timeline["rule"], "#ac6300"),
+        ("Modelo de audio", timeline["audio"], "#21835e"),
+    ]
+    for i, (_, times, color) in enumerate(rows):
+        axis.scatter([t - origin for t in times], [i] * len(times), color=color,
+                     marker="|", s=150, linewidths=2)
+    intervals = timeline["intervals"]
+    for (_, end), (start, _) in zip(intervals, intervals[1:]):
+        axis.axvspan(end - origin, start - origin, color="#c8c8c8", alpha=0.5)
+    axis.set_xlim(-0.1, intervals[-1][1] - origin + 0.1)
+    axis.set_yticks(range(len(rows)), [row[0] for row in rows])
+    axis.set_ylim(3.6, -0.6)
+    axis.set_xlabel("Segundos desde el inicio del primer tramo evaluado")
+    axis.set_title("Marcas manuales y candidatos en una sesión independiente")
+    axis.grid(axis="x", alpha=0.2)
+    fig.savefig(session / "audio_comparison.png", dpi=130)
     print(f"Comparación sobre {report['scored_seconds']:.1f} s. "
           f"Marcas evaluadas: {report['scored_labels']}; fuera de cobertura: {report['excluded_labels']}.")
     for key, name in (("detector_actual", "Regla"), ("modelo_audio", "IA de audio")):
@@ -337,12 +381,24 @@ def main(argv=None):
                         help="mostrar también los candidatos del modelo piloto de audio")
     parser.add_argument("--record-session", action="store_true",
                         help="activar el experimento y guardar audio continuo para comparar ambos detectores")
+    parser.add_argument("--activity-model", type=Path, default=DEFAULT_ACTIVITY_MODEL,
+                        help="clasificador en vivo de actividades de audio y movimiento")
+    motion_options = parser.add_mutually_exclusive_group()
+    motion_options.add_argument("--motion-cough-model", type=Path, help="ajuste para movimiento de cabeza y tos")
+    motion_options.add_argument("--no-motion-cough", action="store_true", help="usar solo el modelo anterior")
     args = parser.parse_args(argv)
     args.experiment = args.experiment or args.record_session
     try:
+        activity_model = ActivityModel.load(args.activity_model)
+        motion_path = args.motion_cough_model
+        if not args.no_motion_cough and motion_path is None and args.activity_model.resolve() == DEFAULT_ACTIVITY_MODEL:
+            motion_path = DEFAULT_MOTION_COUGH
+        motion_cough = MotionCoughSpecialist.load(motion_path) if motion_path else None
         model = AudioModel.load(args.audio_model) if args.audio_model else None
+        if not set(activity_model.classes).issubset(ACTIVITY_NAMES):
+            raise ValueError("El modelo contiene categorías de actividad desconocidas.")
     except (ValueError, OSError) as error:
-        parser.error(f"No se pudo abrir el modelo de audio: {error}")
+        parser.error(f"No se pudo abrir el modelo: {error}")
     if not np.isfinite(args.tolerance) or args.tolerance < 0:
         parser.error("--tolerance debe ser un número finito mayor o igual a cero.")
 
@@ -368,6 +424,13 @@ def main(argv=None):
     ai_count = 0
     ai_recent = deque()
     recording = None
+    last_block_end = None
+    valid_frames = 0
+    last_classified = None
+    activity_predictions = []
+    voice_history = deque(maxlen=2)
+    screen_estimate = (None, "waiting", "waiting")
+    estimates_at_marks = []
 
     port_name = choose_arduino_port(list(list_ports.comports()))
     detector = SwallowEventDetector(
@@ -396,7 +459,7 @@ def main(argv=None):
         print(f"Match tolerance: {args.tolerance:.1f} s. Report: {session}")
 
     def audio_callback(indata, frames, time_info, status):
-        nonlocal audio_clock_offset
+        nonlocal audio_clock_offset, last_block_end, valid_frames
         if stop_event.is_set():
             return
         stamp = time.monotonic()
@@ -404,26 +467,29 @@ def main(argv=None):
             print(status)
         chunk = np.array(indata[:, 0], copy=True)
         seen["audio"] = stamp
-        if capture is not None or audio_ai is not None:
-            adc = getattr(time_info, "inputBufferAdcTime", 0.0)
-            current = getattr(time_info, "currentTime", 0.0)
-            if 0 < adc <= current and np.isfinite(current):
-                # Anchor the stream clock once so callback scheduling jitter does
-                # not shift otherwise contiguous blocks on the label timeline.
-                if audio_clock_offset is None:
-                    audio_clock_offset = stamp - current
-                block_start = adc + audio_clock_offset
-            else:
-                block_start = stamp - frames / sample_rate
-            if capture is not None:
-                capture.add_audio(chunk, block_start)
-            if detector.ready and signal_status(stamp, seen["imu"]) == "Connected" and not status:
-                if recording is not None:
-                    recording.add_audio(chunk, block_start)
-                if audio_ai is not None:
-                    with audio_lock:
-                        ai_pending.append((block_start, chunk))
+        adc = getattr(time_info, "inputBufferAdcTime", 0.0)
+        current = getattr(time_info, "currentTime", 0.0)
+        if 0 < adc <= current and np.isfinite(current):
+            # Anchor the stream clock once so callback scheduling jitter does
+            # not shift otherwise contiguous blocks on the label timeline.
+            if audio_clock_offset is None:
+                audio_clock_offset = stamp - current
+            block_start = adc + audio_clock_offset
+        else:
+            block_start = stamp - frames / sample_rate
+        if capture is not None:
+            capture.add_audio(chunk, block_start)
+        if detector.ready and signal_status(stamp, seen["imu"]) == "Connected" and not status:
+            if recording is not None:
+                recording.add_audio(chunk, block_start)
+            if audio_ai is not None:
+                with audio_lock:
+                    ai_pending.append((block_start, chunk))
         with audio_lock:
+            if last_block_end is None or abs(block_start - last_block_end) > 0.002:
+                valid_frames = 0
+            last_block_end = block_start + frames / sample_rate
+            valid_frames = 0 if status else min(sample_rate, valid_frames + frames)
             if frames >= len(audio_buffer):
                 audio_buffer[:] = indata[-len(audio_buffer):, 0]
             else:
@@ -463,12 +529,14 @@ def main(argv=None):
     recent_marks = deque()
 
     def update():
-        nonlocal ai_count
+        nonlocal ai_count, last_classified, screen_estimate
         if stop_event.is_set():
             plt.close(dashboard["fig"])
             return False
         with audio_lock:
             audio = audio_buffer.copy()
+            audio_end = last_block_end
+            has_window = valid_frames >= sample_rate
             pending = list(ai_pending)
             ai_pending.clear()
         for block_start, chunk in pending:
@@ -478,6 +546,39 @@ def main(argv=None):
         with imu_lock:
             rows = list(imu_data)
         now = time.monotonic()
+        if (not has_window or audio_end is None or not detector.ready or
+                any(signal_status(now, last) != "Connected" for last in seen.values())):
+            voice_history.clear()
+            screen_estimate = (None, "waiting", "waiting")
+            dashboard["activity_text"].set_text("Activity estimate\nWaiting for signal")
+        elif last_classified is None or audio_end - last_classified >= 0.20:
+            last_classified = audio_end
+            category, score = "uncertain", None
+            if sample_rate >= 25:
+                try:
+                    window = audio[-sample_rate:]
+                    features = extract_activity_features(window, sample_rate, rows, audio_end)
+                    voice = extract_voice_features(window, sample_rate) if activity_model.has_voice_specialist else None
+                    if motion_cough is None or sample_rate < 50:
+                        category, score = activity_model.predict(features, voice_features=voice)
+                    else:
+                        scores = activity_model.scores(features, voice)
+                        motion_features = extract_motion_cough_features(window, sample_rate, rows, audio_end)
+                        category, score = motion_cough.predict(scores, motion_features)
+                except InsufficientMotion:
+                    voice_history.clear()
+            shown = displayed_activity(category, audio_end, voice_history)
+            if shown != category and now - voice_history[-1][0] > 0.5:
+                shown = category
+            voice_history.append((audio_end, category))
+            suffix = " (recent)" if shown != category else ""
+            screen_estimate = (audio_end, category, shown)
+            dashboard["activity_text"].set_text(f"Activity estimate\n{ACTIVITY_NAMES[shown]}{suffix}")
+            if args.record_session:
+                activity_predictions.append((audio_end, category, score, shown))
+        if screen_estimate[1] != screen_estimate[2] and voice_history and now - voice_history[0][0] > 0.5:
+            screen_estimate = (screen_estimate[0], "uncertain", "uncertain")
+            dashboard["activity_text"].set_text("Activity estimate\nUncertain")
         if capture is not None:
             capture.flush(now)
         while recent_marks and recent_marks[0][0]["time"] < now - WINDOW_SECONDS:
@@ -510,6 +611,8 @@ def main(argv=None):
                 return
             category, title = chosen
             label = experiment.add_label(category)
+            if args.record_session:
+                estimates_at_marks.append((label["id"], label["time"], category, *screen_estimate))
             capture.mark(label)
             recent_marks.append((label, key))
             clock = label["timestamp"].split("T")[1][:8]
@@ -573,6 +676,21 @@ def main(argv=None):
             finally:
                 summary = experiment.finish(session_events, ended=ended)
                 print(format_summary(summary))
+                if args.record_session:
+                    with (session / "activity_predictions.csv").open("w", newline="") as out:
+                        writer = csv.writer(out)
+                        writer.writerow(["window_end_monotonic", "estimated_activity", "score", "displayed_activity"])
+                        writer.writerows(activity_predictions)
+                    with (session / "activity_at_marks.csv").open("w", newline="") as out:
+                        writer = csv.writer(out)
+                        writer.writerow(["label_id", "mark_monotonic", "manual_activity",
+                                         "window_end_monotonic", "estimated_activity", "displayed_activity"])
+                        writer.writerows(estimates_at_marks)
+    if args.record_session:
+        try:
+            save_activity_report(session, activity_model, motion_cough)
+        except (OSError, ValueError) as error:
+            print(f"Evaluación de actividades pendiente: {error}")
     if args.record_session and model is not None:
         try:
             save_audio_comparison(session, model)
@@ -590,4 +708,13 @@ def experiment_directory(root=Path("experiments")):
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    options = sys.argv[1:]
+    if options in ([], ["--record-session"]):
+        from local_dashboard import run
+        try:
+            run()
+        except KeyboardInterrupt:
+            pass
+    else:
+        main([arg for arg in options if arg != "--desktop"])

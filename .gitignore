@@ -3,6 +3,10 @@ __pycache__/
 experiments/
 dysphagrip_events.csv
 .venv/
+.env
+.env.*
+!.env.example
+tempCodeRunnerFile.py
 .DS_Store
 saliva*.wav
 dysphagrip_test.wav

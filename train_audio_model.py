@@ -39,7 +39,7 @@ def read_labels(session):
     return labels
 
 
-def labeled_features(folder, label):
+def labeled_audio(folder, label):
     metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
     if (metadata["label_id"] != label["id"] or metadata["category"] != label["category"]
             or not math.isclose(metadata["label_monotonic"], label["time"], abs_tol=1e-5, rel_tol=0)):
@@ -65,7 +65,11 @@ def labeled_features(folder, label):
     if missing > 0.001:
         raise ValueError("Faltan más de 1 ms de audio dentro de la ventana")
     samples = np.frombuffer(raw, dtype="<i4").astype(np.float64) / 2**31
-    return extract_features(samples, rate)
+    return samples, rate
+
+
+def labeled_features(folder, label):
+    return extract_features(*labeled_audio(folder, label))
 
 
 def train_sessions(sessions, model_path):

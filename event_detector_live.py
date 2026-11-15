@@ -315,7 +315,7 @@ class SwallowEventDetector:
             ])
             file.flush()
 
-        print(f"\n[EVENT {event['event_id']}] Possible Swallow Event Detected")
+        print(f"\n[EVENT {event['event_id']}] Audio + motion trigger")
         print(f"Audio RMS: {event['rms']:.6f}")
         print(f"IMU Activity: {event['imu_activity']:.3f}")
         print(f"Time Difference: {event['time_difference']:.3f}s")
