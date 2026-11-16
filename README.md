@@ -1,73 +1,171 @@
 # DysphaGrip
 
-DysphaGrip combina el sonido de un micrófono de contacto con el movimiento de un sensor MPU6050 conectado a un Arduino. El detector registra un posible evento de deglución cuando ambas señales superan sus umbrales dentro de una ventana de 0.65 segundos. Es un prototipo experimental.
+**Exploring swallowing-related event detection through acoustic sensing, motion tracking, and real-time sensor fusion.**
 
-## Instalar en macOS
+[Project website](docs/index.html) · [System architecture](docs/ARCHITECTURE.md) · [Hardware](docs/HARDWARE.md) · [Setup](docs/SETUP.md) · [Safety](docs/LIMITATIONS.md)
 
-Con Python 3.13 instalado, abre Terminal en la carpeta que contiene este README. Crea el entorno e instala las dependencias con estos comandos.
+**SanD Hacks 2026 · UC San Diego · Experimental research prototype**
 
-```sh
+> **Not a medical device.** DysphaGrip is an engineering proof of concept. A “possible swallow event” is a sensor-triggered candidate, not evidence of safe swallowing, dysphagia, or aspiration. Never use it for clinical decisions.
+
+## The problem
+
+Swallowing difficulties (dysphagia) can affect people recovering from a stroke or living with neurological conditions. Assessing swallowing requires qualified clinicians and, when indicated, clinical instruments. DysphaGrip explores whether inexpensive, complementary sensors can capture patterns associated with swallowing events for future research.
+
+## What we built
+
+DysphaGrip combines two independent data streams:
+
+- **Acoustic signal:** a contact microphone connected through a USB audio interface to a computer.
+- **Motion signal:** three-axis acceleration and three-axis angular velocity from an MPU6050, streamed by an Arduino over USB serial.
+
+Python processes both streams, calibrates against a short quiet baseline, and records a candidate event when an audio trigger and a motion trigger fall within a **0.65-second coincidence window** (default). A cooldown helps reduce repeated counts. The desktop dashboard displays waveforms, motion traces, connection status, and an event history.
+
+This is **rule-based sensor fusion**, not a clinically validated machine-learning classifier.
+
+## Features
+
+| Feature | Current implementation |
+| --- | --- |
+| Live sensor monitoring | Audio via sounddevice; serial motion via pyserial |
+| Adaptive calibration | Baseline-derived thresholds with a minimum five-second calibration |
+| Candidate-event detection | Audio–IMU coincidence and cooldown |
+| Desktop visualization | Matplotlib plots and event history |
+| Experimental labeling | Saliva, water, speaking, head movement, and coughing |
+| Experimental evaluation | Label-to-event matching and session reports; not clinical validation |
+| Automated tests | Python unittest suite |
+| Hardware diagnostics | Arduino sample-rate and serial-frame inspection |
+
+## Architecture
+
+~~~mermaid
+flowchart LR
+    MIC["Contact microphone"] --> USB["USB audio interface"]
+    IMU["MPU6050 · 6 axes"] --> MCU["Arduino · I²C + serial"]
+    USB --> HOST["Python acquisition on computer"]
+    MCU --> HOST
+    HOST --> FEATURES["Audio RMS + IMU features"]
+    FEATURES --> FUSION["Adaptive calibration + time-window fusion"]
+    FUSION --> DASH["Desktop dashboard"]
+    FUSION --> CSV["Candidate-event CSV"]
+    HOST --> CAPTURE["Optional labeled captures"]
+~~~
+
+**The microphone is not connected to the Arduino.** Both devices connect to the computer through separate input paths. See [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Hardware
+
+| Component | Responsibility |
+| --- | --- |
+| Contact microphone | Captures acoustic/vibration activity |
+| M-Audio AIR 192/6 USB audio interface | Provides the audio input explicitly selected in the current Python code |
+| MPU6050 accelerometer + gyroscope | Measures 3 acceleration and 3 rotation axes |
+| Arduino UNO Q | Streams IMU data using the included firmware |
+| Computer running Python | Processes signals, logs events, and renders the UI |
+
+The checked-in sketch imports Arduino_RouterBridge.h and targets **Arduino UNO Q**. Other boards may require firmware changes. See [HARDWARE.md](docs/HARDWARE.md).
+
+## Quick start (macOS)
+
+Requirements: Python 3.13, the connected Arduino and MPU6050, a contact microphone with compatible audio interface, and macOS device permissions.
+
+~~~bash
+git clone https://github.com/maxhrdz/test2.git
+cd test2
 python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-```
+~~~
 
-Cada vez que abras otra terminal, vuelve a la carpeta del proyecto y ejecuta `source .venv/bin/activate`.
+1. Upload the [included Arduino firmware](firmware/dysphagrip_motion/dysphagrip_motion.ino) to the supported board and connect the MPU6050 through I²C.
+2. Connect the Arduino and audio interface by USB, with the microphone plugged into input 1.
+3. Close the Arduino Serial Monitor before launching the Python application.
+4. Remain still and quiet during calibration, then confirm both inputs report **Connected**.
 
-## Comprobar el proyecto sin sensores
+Open the desktop dashboard:
 
-```sh
-python -m unittest discover -v
-```
+~~~bash
+python sensor_fusion_live.py
+~~~
 
-La suite simula las entradas y escribe los resultados en carpetas temporales. Al finalizar, busca `OK` en la terminal.
+Or use the command-line event detector:
 
-## Probar con el micrófono y el Arduino
+~~~bash
+python event_detector_live.py
+~~~
 
-1. Conecta el micrófono de contacto a la entrada 1 de la interfaz M-Audio AIR 192|6. Conecta la interfaz y el Arduino por USB. Si macOS solicita acceso al micrófono, concédelo a la aplicación desde la que ejecutas Python.
-2. El Arduino debe tener cargado un programa que envíe las seis lecturas del MPU6050 a 115200 baudios. Cada muestra ocupa una línea con este formato.
+Run an experiment with manual labels:
 
-   ```text
-   Tilt X: -0.99 Y: 0.00 Z: 0.20 | Turn X: 1.00 Y: 2.00 Z: 3.00
-   ```
-
-3. Cierra el monitor serie del Arduino y ejecuta `python sensor_fusion_live.py` para abrir el tablero. Si se solicita, elige el número del puerto del Arduino. Mantén los sensores quietos y el entorno en silencio hasta que aparezca `Detection active`. La calibración dura al menos cinco segundos.
-4. Comprueba que el tablero muestre `Connected` para el micrófono y el MPU6050. Verifica por separado que hablar cerca del micrófono o rozarlo suavemente cambia la gráfica de audio, y que mover el MPU6050 cambia las gráficas de movimiento. Cierra la ventana al terminar.
-
-Si prefieres ver los eventos en la terminal, ejecuta `python event_detector_live.py` y detén la sesión con `Ctrl+C`. Ambos modos agregan los eventos al historial `dysphagrip_events.csv` en la carpeta de ejecución.
-
-### Comprobar la frecuencia del Arduino UNO Q
-
-El sketch `firmware/dysphagrip_motion/dysphagrip_motion.ino` conserva las seis lecturas del MPU6050 y solicita una muestra cada 40 ms (25 Hz). Cada línea termina con un número de secuencia y el instante de lectura en milisegundos según la placa.
-
-1. Duplica tu proyecto de Arduino para conservar la versión anterior. En la copia, reemplaza el contenido completo del sketch por el archivo indicado. Compílalo para UNO Q y cárgalo cuando quieras probarlo.
-2. Cierra el monitor serie y el tablero. En la terminal, con el entorno del proyecto activo, ejecuta `python test_arduino_connection.py` y selecciona el puerto de la UNO Q si se solicita.
-3. Compara la frecuencia que indica la placa con las lecturas que recibe la Mac. Con este sketch se esperan valores cercanos a 25 por segundo y un intervalo de unos 40 ms en la placa. Los saltos en la secuencia indican muestras que no llegaron al diagnóstico. Cuando termines de comprobar la frecuencia, puedes volver a abrir el tablero.
-
-## Registrar un experimento
-
-```sh
+~~~bash
 python sensor_fusion_live.py --experiment
-```
+~~~
 
-Tras la calibración, haz clic en la ventana del tablero para que reciba el teclado. Justo después de cada acción, pulsa su tecla o haz clic en el botón correspondiente. Comprueba que aparezca la confirmación de la etiqueta y su marca en la gráfica, incluso si el detector no cuenta un evento.
+In experiment mode, click the dashboard and press **1** for saliva swallow, **2** for water swallow, **3** for speaking, **4** for head movement, or **5** for coughing. Each mark records approximately two seconds of data before and after it. Allow time after the final mark for the capture to finish.
 
-Cada marca guarda el audio del micrófono y las seis lecturas de movimiento del Arduino desde dos segundos antes hasta dos segundos después de pulsar. Para comparar movimiento y saliva, repite el movimiento pequeño que quieres evaluar y márcalo con `4`. Marca con `1` cada vez que tragues saliva. Deja unos cinco segundos entre acciones para poder examinarlas por separado. Después de la última marca, espera al menos dos segundos antes de cerrar la ventana.
+For troubleshooting and a breakdown of generated files, see [SETUP.md](docs/SETUP.md).
 
-| Tecla | Etiqueta |
-| --- | --- |
-| 1 | Deglución de saliva |
-| 2 | Deglución de agua |
-| 3 | Hablar |
-| 4 | Mover la cabeza |
-| 5 | Toser |
+## Tests
 
-Cierra la ventana para generar el informe. La terminal indica la carpeta de la sesión dentro de `experiments/`. Abre `summary.csv` para ver los aciertos, las falsas alarmas y las detecciones omitidas. Puedes revisar las etiquetas manuales en `ground_truth.csv`, las detecciones en `predictions.csv` y sus correspondencias en `matches.csv`. La tolerancia temporal predeterminada para comparar etiquetas y detecciones es de 1.5 segundos.
+The unit tests do not require attached hardware:
 
-Dentro de esa misma sesión, abre `captures/mark_0001/` para revisar la primera marca. El número de carpeta corresponde al de la etiqueta guardada en el tablero y en `ground_truth.csv`.
+~~~bash
+python -m unittest discover -v
+~~~
 
-| Archivo por marca | Qué contiene |
-| --- | --- |
-| `audio.wav` | Audio del micrófono de contacto a la frecuencia de muestreo de la sesión. |
-| `motion.csv` | Los tres ejes de aceleración y los tres de giro. El tiempo relativo vale cero al pulsar la marca. |
-| `metadata.json` | Etiqueta, tiempos y cobertura de los sensores. Permite comprobar si se capturó toda la ventana. |
+Diagnose the Arduino's sample delivery rate:
+
+~~~bash
+python test_arduino_connection.py
+~~~
+
+The included firmware requests a sample approximately every **40 ms (25 Hz)**. This is a target, not a reported experimental result.
+
+## Repository map
+
+~~~text
+.
+├── README.md
+├── requirements.txt
+├── event_detector_live.py           # Detector and input integration
+├── sensor_fusion_live.py            # Desktop dashboard and experiments
+├── label_capture.py                 # Time-aligned audio / motion captures
+├── validation.py                    # Experimental label matching
+├── test_*.py                        # Tests and diagnostic scripts
+├── firmware/
+│   └── dysphagrip_motion/
+│       └── dysphagrip_motion.ino
+└── docs/
+    ├── index.html                   # Static project showcase
+    ├── ARCHITECTURE.md
+    ├── HARDWARE.md
+    ├── SETUP.md
+    └── LIMITATIONS.md
+~~~
+
+## Evaluation and limitations
+
+Labeled sessions can generate ground_truth.csv, predictions.csv, matches.csv, summary.csv, and per-label captures under experiments/. These artifacts help examine false triggers, missed labeled events, and event timing. **No validated sensitivity, specificity, accuracy, or clinical performance is claimed here.**
+
+Talking, coughing, head movement, sensor shifts, and environmental noise may cause false triggers. A missed event does not mean swallowing was safe. DysphaGrip **does not detect or rule out silent aspiration**. Read [LIMITATIONS.md](docs/LIMITATIONS.md).
+
+## Roadmap
+
+- Collect appropriately consented and carefully labeled data across people and environments.
+- Measure false positives, missed candidate events, and signal quality with a repeatable protocol.
+- Improve synchronization and sensor-placement consistency.
+- Compare rule-based fusion to machine-learning methods after adequate data collection.
+- Explore a smaller wearable form factor with appropriate clinical and engineering collaboration.
+
+These are proposed next steps, not completed features.
+
+## Website
+
+The static showcase lives in [docs/index.html](docs/index.html). To publish it, open **GitHub Settings → Pages → Deploy from a branch → main → /docs → Save**. GitHub Pages will display a public URL after deployment. The showcase is informational; the live sensor dashboard runs locally in Python.
+
+## Credits
+
+Created as a team project at **SanD Hacks 2026**, hosted at **UC San Diego**. Add individual team credits after confirming the appropriate attributions.
+
+## License
+
+No license has been selected. Public repository visibility does not itself grant permission to reuse the code; add a license after the contributors agree.
