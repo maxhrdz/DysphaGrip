@@ -1,12 +1,15 @@
-
 import csv
+import os
+import re
 import time
 import threading
 from pathlib import Path
 from datetime import datetime
-from collections import deque
 
 import numpy as np
+
+
+RECENT_EVENT_LIMIT = 200
 
 
 class SwallowEventDetector:
@@ -15,6 +18,7 @@ class SwallowEventDetector:
 
     This is NOT a medical diagnostic device.
     It does not detect aspiration or determine swallow safety.
+    A detection is only a candidate: "Possible Swallow Event".
     """
 
     def __init__(
@@ -25,6 +29,7 @@ class SwallowEventDetector:
         audio_multiplier=2.5,
         imu_multiplier=3.0,
         csv_path="dysphagrip_events.csv",
+        keep_session_events=False,
     ):
         self.calibration_seconds = calibration_seconds
         self.coincidence_seconds = coincidence_seconds
@@ -45,45 +50,58 @@ class SwallowEventDetector:
         self.turn_threshold = None
 
         self.previous_tilt = None
+        self.audio_needs_release = False
+        self.motion_needs_release = False
         self.last_audio_hit = None
         self.last_imu_hit = None
 
         self.ready = False
         self.event_count = 0
+        self.events = []
+        self.keep_session_events = keep_session_events
         self.last_calibration_warning = 0.0
 
         self.csv_path = Path(csv_path)
-        self.csv_path.parent.mkdir(
-            parents=True, exist_ok=True
-        )
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with self.csv_path.open(
-            "w", newline="", encoding="utf-8"
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "timestamp",
-                "elapsed_seconds",
-                "event_id",
-                "event_type",
-                "audio_rms",
-                "audio_threshold",
-                "tilt_delta",
-                "turn_magnitude",
-            ])
+        # Write the header at offset zero, even if two sessions start together.
+        fd = os.open(self.csv_path, os.O_RDWR | os.O_CREAT, 0o666)
+        with os.fdopen(fd, "r+", newline="", encoding="utf-8") as file:
+            if not file.read(1):
+                csv.writer(file).writerow([
+                    "timestamp",
+                    "elapsed_seconds",
+                    "event_id",
+                    "event_type",
+                    "audio_rms",
+                    "audio_peak",
+                    "audio_threshold",
+                    "imu_activity",
+                    "tilt_delta",
+                    "turn_magnitude",
+                    "time_difference_seconds",
+                ])
 
         print("[DysphaGrip] Detector initialized")
-        print("[Calibration] Remain still and silent.")
+        print("[DysphaGrip] Not a medical assessment of swallow safety.")
+        print(
+            "[Calibration] Remain still and silent "
+            f"for {self.calibration_seconds:.0f} seconds."
+        )
 
     @staticmethod
     def calculate_threshold(values, multiplier, floor):
+        """Threshold above the quiet-period noise, not inside it."""
         data = np.asarray(values, dtype=float)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return floor
 
         median = float(np.median(data))
         mad = float(np.median(np.abs(data - median)))
-
+        noise_ceiling = float(np.percentile(data, 95))
         return max(
-            median * multiplier,
+            noise_ceiling * multiplier,
             median + 6.0 * mad,
             floor,
         )
@@ -92,9 +110,7 @@ class SwallowEventDetector:
         if self.ready:
             return
 
-        elapsed = now - self.start_time
-
-        if elapsed < self.calibration_seconds:
+        if now - self.start_time < self.calibration_seconds:
             return
 
         if (
@@ -102,10 +118,16 @@ class SwallowEventDetector:
             or len(self.tilt_calibration) < 20
         ):
             if now - self.last_calibration_warning > 3.0:
-                print(
-                    "[Calibration] Waiting for audio "
-                    "and IMU samples..."
-                )
+                missing = []
+                if len(self.audio_calibration) < 20:
+                    missing.append(
+                        f"audio {len(self.audio_calibration)}/20"
+                    )
+                if len(self.tilt_calibration) < 20:
+                    missing.append(
+                        f"IMU {len(self.tilt_calibration)}/20"
+                    )
+                print("[Calibration] Waiting for " + ", ".join(missing))
                 self.last_calibration_warning = now
             return
 
@@ -114,43 +136,28 @@ class SwallowEventDetector:
             self.audio_multiplier,
             floor=0.0001,
         )
-
         self.tilt_threshold = self.calculate_threshold(
             self.tilt_calibration,
             self.imu_multiplier,
             floor=1e-6,
         )
-
         self.turn_threshold = self.calculate_threshold(
             self.turn_calibration,
             self.imu_multiplier,
             floor=1e-6,
         )
-
         self.ready = True
 
-        print("\n[Calibration] Complete!")
-        print(
-            f"Audio threshold: {self.audio_threshold:.6f}"
-        )
-        print(
-            f"Tilt threshold: {self.tilt_threshold:.6f}"
-        )
-        print(
-            f"Turn threshold: {self.turn_threshold:.6f}"
-        )
-        print("[DysphaGrip] Detection active.\n")
+        print(f"Audio threshold: {self.audio_threshold:.6f}")
+        print(f"Tilt threshold: {self.tilt_threshold:.6f}")
+        print(f"Turn threshold: {self.turn_threshold:.6f}")
+        print("[DysphaGrip] Calibration complete")
+        print("[DysphaGrip] Detection active")
 
-    def on_audio(self, audio_samples):
-        """
-        Call with each audio chunk from Step 9.
-        Accepts mono or multichannel NumPy audio.
-        """
-
+    def _audio_features(self, audio_samples):
         raw = np.asarray(audio_samples)
-
         if raw.size == 0:
-            return
+            return None, None
 
         if np.issubdtype(raw.dtype, np.integer):
             scale = max(
@@ -162,76 +169,64 @@ class SwallowEventDetector:
             samples = raw.astype(np.float64)
 
         if not np.all(np.isfinite(samples)):
-            return
+            return None, None
 
         if samples.ndim == 2:
-            # Use the first channel. Set Step 9 to
-            # select the channel with the contact pickup.
             samples = samples[:, 0]
+        elif samples.ndim != 1:
+            return None, None
 
-        rms = float(
-            np.sqrt(np.mean(np.square(samples)))
-        )
+        rms = float(np.sqrt(np.mean(np.square(samples))))
         peak = float(np.max(np.abs(samples)))
+        return rms, peak
 
-        now = time.monotonic()
+    def on_audio(self, audio_samples, now=None):
+        """Feed one audio chunk from the Step 9 callback. Channel 0 is the pickup."""
+        now = time.monotonic() if now is None else float(now)
+        rms, peak = self._audio_features(audio_samples)
+        if rms is None:
+            return
 
+        event = None
         with self.lock:
             if not self.ready:
                 self.audio_calibration.append(rms)
                 self.try_finish_calibration(now)
                 return
 
-            if rms >= self.audio_threshold:
-                self.last_audio_hit = {
-                    "time": now,
-                    "rms": rms,
-                    "peak": peak,
-                }
-                self.try_detect(now)
+            if rms < self.audio_threshold:
+                self.audio_needs_release = False
+                return
+            if now - self.last_event_time < self.cooldown_seconds:
+                self.audio_needs_release = True
+                return
+            if self.audio_needs_release:
+                return
+            self.last_audio_hit = {"time": now, "rms": rms, "peak": peak}
+            event = self.try_detect(now)
 
-    def on_imu(self, tilt_xyz, turn_xyz):
-        """
-        Call with two triples from Step 9.
+        if event:
+            self._record(event)
 
-        tilt_xyz: three acceleration/orientation values
-        turn_xyz: three gyroscope/rate values
-
-        Keep the same units and data meaning during
-        calibration and detection.
-        """
-
+    def on_imu(self, tilt_xyz, turn_xyz, now=None):
+        """Feed one MPU6050 sample: tilt (accel) and turn (gyro), three values each."""
+        now = time.monotonic() if now is None else float(now)
         tilt = np.asarray(tilt_xyz, dtype=float)
         turn = np.asarray(turn_xyz, dtype=float)
 
         if tilt.shape != (3,) or turn.shape != (3,):
-            raise ValueError(
-                "IMU inputs must each contain 3 values."
-            )
-
-        if not (
-            np.all(np.isfinite(tilt))
-            and np.all(np.isfinite(turn))
-        ):
+            return
+        if not (np.all(np.isfinite(tilt)) and np.all(np.isfinite(turn))):
             return
 
-        now = time.monotonic()
-
+        event = None
         with self.lock:
             if self.previous_tilt is None:
                 self.previous_tilt = tilt.copy()
                 return
 
-            tilt_delta = float(
-                np.linalg.norm(
-                    tilt - self.previous_tilt
-                )
-            )
-
-            turn_magnitude = float(
-                np.linalg.norm(turn)
-            )
-
+            tilt_delta = float(np.linalg.norm(tilt - self.previous_tilt))
+            turn_magnitude = float(np.linalg.norm(turn))
             self.previous_tilt = tilt.copy()
 
             if not self.ready:
@@ -240,90 +235,234 @@ class SwallowEventDetector:
                 self.try_finish_calibration(now)
                 return
 
-            movement_detected = (
-                tilt_delta >= self.tilt_threshold
-                or turn_magnitude >= self.turn_threshold
-            )
+            if tilt_delta < self.tilt_threshold and turn_magnitude < self.turn_threshold:
+                self.motion_needs_release = False
+                return
+            if now - self.last_event_time < self.cooldown_seconds:
+                self.motion_needs_release = True
+                return
+            if self.motion_needs_release:
+                return
+            self.last_imu_hit = {
+                "time": now,
+                "tilt_delta": tilt_delta,
+                "turn_magnitude": turn_magnitude,
+            }
+            event = self.try_detect(now)
 
-            if movement_detected:
-                self.last_imu_hit = {
-                    "time": now,
-                    "tilt_delta": tilt_delta,
-                    "turn_magnitude": turn_magnitude,
-                }
-                self.try_detect(now)
+        if event:
+            self._record(event)
 
     def try_detect(self, now):
-        if (
-            self.last_audio_hit is None
-            or self.last_imu_hit is None
-        ):
-            return
+        if self.last_audio_hit is None or self.last_imu_hit is None:
+            return None
 
         audio = self.last_audio_hit
         imu = self.last_imu_hit
-
-        time_difference = abs(
-            audio["time"] - imu["time"]
-        )
+        time_difference = abs(audio["time"] - imu["time"])
 
         if time_difference > self.coincidence_seconds:
-            return
-
-        if (
-            now - min(audio["time"], imu["time"])
-            > self.coincidence_seconds
-        ):
-            return
-
-        if (
-            now - self.last_event_time
-            < self.cooldown_seconds
-        ):
-            return
+            return None
+        if now - min(audio["time"], imu["time"]) > self.coincidence_seconds:
+            return None
+        if now - self.last_event_time < self.cooldown_seconds:
+            self.last_audio_hit = None
+            self.last_imu_hit = None
+            return None
 
         self.last_event_time = now
+        self.audio_needs_release = True
+        self.motion_needs_release = True
         self.event_count += 1
-
-        timestamp = datetime.now().astimezone().isoformat(
-            timespec="milliseconds"
-        )
-
-        elapsed = now - self.start_time
-
-        with self.csv_path.open(
-            "a", newline="", encoding="utf-8"
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                timestamp,
-                round(elapsed, 3),
-                self.event_count,
-                "possible_swallow",
-                round(audio["rms"], 6),
-                round(self.audio_threshold, 6),
-                round(imu["tilt_delta"], 6),
-                round(imu["turn_magnitude"], 6),
-            ])
-
-        print(
-            f"\n[EVENT {self.event_count}] "
-            "Possible swallow detected"
-        )
-        print(
-            f" Audio RMS: {audio['rms']:.6f}"
-        )
-        print(
-            f" IMU delta: {imu['tilt_delta']:.6f}"
-        )
-        print(
-            f" Time difference: {time_difference:.3f}s"
-        )
-        print(
-            f" Total events: {self.event_count}\n"
-        )
-
-        # Prevent reusing the same sensor peaks.
+        imu_activity = max(imu["tilt_delta"], imu["turn_magnitude"])
+        event = {
+            "event_id": self.event_count,
+            "monotonic": now,
+            "timestamp": datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            ),
+            "elapsed": now - self.start_time,
+            "rms": audio["rms"],
+            "peak": audio["peak"],
+            "tilt_delta": imu["tilt_delta"],
+            "turn_magnitude": imu["turn_magnitude"],
+            "imu_activity": imu_activity,
+            "time_difference": time_difference,
+            "audio_threshold": self.audio_threshold,
+        }
         self.last_audio_hit = None
         self.last_imu_hit = None
+        self.events.append(event)
+        if not self.keep_session_events and len(self.events) > RECENT_EVENT_LIMIT:
+            del self.events[:-RECENT_EVENT_LIMIT]
+        return event
 
+    def _record(self, event):
+        with self.csv_path.open("a", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                event["timestamp"],
+                round(event["elapsed"], 3),
+                event["event_id"],
+                "possible_swallow_event",
+                round(event["rms"], 6),
+                round(event["peak"], 6),
+                round(event["audio_threshold"], 6),
+                round(event["imu_activity"], 6),
+                round(event["tilt_delta"], 6),
+                round(event["turn_magnitude"], 6),
+                round(event["time_difference"], 3),
+            ])
+            file.flush()
+
+        print(f"\n[EVENT {event['event_id']}] Possible Swallow Event Detected")
+        print(f"Audio RMS: {event['rms']:.6f}")
+        print(f"IMU Activity: {event['imu_activity']:.3f}")
+        print(f"Time Difference: {event['time_difference']:.3f}s")
+        print(f"Total Events: {event['event_id']}")
+
+
+IMU_NUMBER = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+IMU_PATTERN = re.compile(
+    rf"Tilt X:\s*{IMU_NUMBER}\s+Y:\s*{IMU_NUMBER}\s+Z:\s*{IMU_NUMBER}\s*\|\s*"
+    rf"Turn X:\s*{IMU_NUMBER}\s+Y:\s*{IMU_NUMBER}\s+Z:\s*{IMU_NUMBER}(?=\s|$)"
+)
+
+
+def parse_imu_line(line):
+    match = IMU_PATTERN.search(line)
+    if not match:
+        return None
+    values = tuple(float(value) for value in match.groups())
+    return values if np.isfinite(values).all() else None
+
+
+def read_arduino(port_name, stop_event, on_sample):
+    import serial
+
+    with serial.Serial(port_name, 115200, timeout=0.2) as arduino:
+        print(f"Puerto serie abierto: {port_name}")
+        last_sample_at = time.monotonic()
+        warned = False
+        last_line = ""
+        while not stop_event.is_set():
+            raw = arduino.readline()
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                last_line = line
+            values = parse_imu_line(line) if raw.endswith((b"\n", b"\r")) else None
+            if values is not None:
+                last_sample_at = time.monotonic()
+                warned = False
+                on_sample(values)
+            elif not warned and time.monotonic() - last_sample_at > 2.0:
+                print(f"Sin tramas IMU en {port_name}. Última línea: {last_line!r}")
+                warned = True
+
+
+def find_contact_mic():
+    """El índice de PortAudio cambia al conectar monitores u otros dispositivos."""
+    import sounddevice as sd
+
+    for index, dev in enumerate(sd.query_devices()):
+        name = str(dev["name"]).lower()
+        if int(dev["max_input_channels"]) < 1:
+            continue
+        if "air 192" in name or "m-audio" in name:
+            return index, dev
+    raise SystemExit(
+        "No se encontró el M-Audio AIR 192|6. "
+        "Conéctalo por USB y vuelve a correr el script."
+    )
+
+
+def arduino_port_score(port):
+    text = f"{port.device} {port.description or ''}".lower()
+    if any(token in text for token in ("usbmodem", "uno", "arduino")):
+        return 0
+    if any(token in text for token in ("bluetooth", "debug-console")):
+        return 2
+    return 1
+
+
+def choose_arduino_port(ports):
+    if not ports:
+        raise SystemExit("No hay puertos serie. Revisa el USB del Arduino.")
+    candidates = [port for port in ports if arduino_port_score(port) == 0]
+    if len(candidates) == 1:
+        port = candidates[0]
+        print(f"Arduino: {port.device} - {port.description}")
+        return port.device
+
+    shown = candidates or list(ports)
+    print("Puertos del Arduino:")
+    for index, port in enumerate(shown):
+        print(f"{index}: {port.device} - {port.description}")
+    try:
+        selected = int(input("Arduino port index: "))
+    except (ValueError, EOFError):
+        raise SystemExit("Selecciona el número de un puerto de la lista.") from None
+    if not 0 <= selected < len(shown):
+        raise SystemExit("Selecciona el número de un puerto de la lista.")
+    return shown[selected].device
+
+
+def main():
+    import sounddevice as sd
+    from serial.tools import list_ports
+
+    device, info = find_contact_mic()
+    sample_rate = int(info["default_samplerate"])
+    channels = int(info["max_input_channels"])
+    print(
+        f"Audio: {info['name']} "
+        f"(device {device}, {channels} ch @ {sample_rate} Hz)"
+    )
+
+    port_name = choose_arduino_port(list(list_ports.comports()))
+    detector = SwallowEventDetector()
+    stop_event = threading.Event()
+
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(status)
+        detector.on_audio(np.array(indata[:, 0], copy=True))
+
+    reader_error = None
+
+    def on_sample(values):
+        detector.on_imu(values[:3], values[3:])
+
+    def run_reader():
+        nonlocal reader_error
+        try:
+            read_arduino(port_name, stop_event, on_sample)
+        except Exception as error:
+            reader_error = error
+            stop_event.set()
+
+    reader = threading.Thread(target=run_reader, daemon=True)
+    reader.start()
+    print("Ctrl+C para detener.")
+
+    try:
+        with sd.InputStream(
+            device=device,
+            channels=channels,
+            samplerate=sample_rate,
+            blocksize=1024,
+            dtype="float32",
+            callback=audio_callback,
+        ):
+            stop_event.wait()
+    except KeyboardInterrupt:
+        print("\nDetenido.")
+    finally:
+        stop_event.set()
+        reader.join(timeout=1)
+    if reader_error is not None:
+        raise SystemExit(f"Error de lectura del Arduino: {reader_error}") from reader_error
+
+
+if __name__ == "__main__":
+    main()
